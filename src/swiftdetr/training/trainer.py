@@ -37,8 +37,8 @@ logger = get_logger()
 # ---------------------------------------------------------------------------
 
 def _is_ddp() -> bool:
-    """Return True when running under torchrun (LOCAL_RANK env var set)."""
-    return "LOCAL_RANK" in os.environ
+    """Return True when running under torchrun (WORLD_SIZE > 1)."""
+    return int(os.environ.get("WORLD_SIZE", 1)) > 1
 
 
 def _local_rank() -> int:
@@ -48,7 +48,7 @@ def _local_rank() -> int:
 def _world_size() -> int:
     if dist.is_available() and dist.is_initialized():
         return dist.get_world_size()
-    return 1
+    return int(os.environ.get("WORLD_SIZE", 1))
 
 
 def _rank() -> int:
@@ -65,7 +65,8 @@ def _setup_ddp() -> torch.device:
     """Initialize NCCL process group and return the local CUDA device."""
     local = _local_rank()
     torch.cuda.set_device(local)
-    dist.init_process_group(backend="nccl")
+    if not (dist.is_available() and dist.is_initialized()):
+        dist.init_process_group(backend="nccl")
     device = torch.device(f"cuda:{local}")
     logger.info(
         "DDP initialised: rank=%d / world=%d | device=%s",
