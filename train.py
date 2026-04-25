@@ -21,6 +21,9 @@ Examples::
 
     # Resume a Lightning checkpoint
     python train.py --dataset /data/coco --output ./out --resume ./out/last.ckpt
+
+    # Augmentation: backend (cpu / auto / gpu) and preset (default, conservative, …)
+    python train.py --dataset /data/coco --output ./out --aug-preset aggressive --augmentation-backend auto
 """
 
 from __future__ import annotations
@@ -43,6 +46,12 @@ from swiftdetr.config import (  # noqa: E402
     SwiftDetrTinyConfig,
     TrainConfig,
 )
+from swiftdetr.datasets.aug_config import (  # noqa: E402
+    AUG_AERIAL,
+    AUG_AGGRESSIVE,
+    AUG_CONSERVATIVE,
+    AUG_INDUSTRIAL,
+)
 from swiftdetr.training.module_data import SwiftDetrDataModule  # noqa: E402
 from swiftdetr.training.module_model import SwiftDetrModule  # noqa: E402
 from swiftdetr.training.trainer import build_trainer  # noqa: E402
@@ -51,6 +60,16 @@ _VARIANT: dict[str, Type[ModelConfig]] = {
     "tiny": SwiftDetrTinyConfig,
     "small": SwiftDetrSmallConfig,
     "base": SwiftDetrBaseConfig,
+}
+
+# Maps --aug-preset to TrainConfig.aug_config (``None`` = use library default AUG_CONFIG).
+_AUG_PRESET = {
+    "default": None,
+    "conservative": AUG_CONSERVATIVE,
+    "aggressive": AUG_AGGRESSIVE,
+    "aerial": AUG_AERIAL,
+    "industrial": AUG_INDUSTRIAL,
+    "none": {},
 }
 
 
@@ -120,6 +139,25 @@ def parse_args() -> argparse.Namespace:
         help="Optional SWIFTNet ImageNet trunk checkpoint (loaded into the backbone).",
     )
     p.add_argument(
+        "--augmentation-backend",
+        type=str,
+        choices=("cpu", "auto", "gpu"),
+        default="cpu",
+        help="Where Albumentations/Kornia augmentations run: cpu (Albumentations on CPU), "
+        "auto (GPU if CUDA+kornia), or gpu (requires CUDA and kornia).",
+    )
+    p.add_argument(
+        "--aug-preset",
+        type=str,
+        choices=tuple(_AUG_PRESET),
+        default="default",
+        metavar="NAME",
+        help=(
+            "Augmentation policy: default=library AUG_CONFIG; conservative/aggressive/aerial/"
+            "industrial (see swiftdetr.datasets.aug_config); none=no augmentations."
+        ),
+    )
+    p.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -156,16 +194,20 @@ def main() -> None:
         _mc["positional_encoding_size"] = args.resolution // 16
     model_config = _VARIANT[args.variant](**_mc)
 
-    train_config = TrainConfig(
-        dataset_dir=dataset_dir,
-        output_dir=output_dir,
-        dataset_file=args.dataset_file,  # type: ignore[arg-type]
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        grad_accum_steps=args.grad_accum,
-        num_workers=args.num_workers,
-        seed=args.seed,
-    )
+    train_kwargs: dict = {
+        "dataset_dir": dataset_dir,
+        "output_dir": output_dir,
+        "dataset_file": args.dataset_file,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "grad_accum_steps": args.grad_accum,
+        "num_workers": args.num_workers,
+        "seed": args.seed,
+        "augmentation_backend": args.augmentation_backend,  # type: ignore[assignment]
+    }
+    if args.aug_preset != "default":
+        train_kwargs["aug_config"] = _AUG_PRESET[args.aug_preset]
+    train_config = TrainConfig(**train_kwargs)
 
     if args.seed is not None:
         from pytorch_lightning import seed_everything
