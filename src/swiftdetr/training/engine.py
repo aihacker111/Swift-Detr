@@ -27,7 +27,6 @@ except ImportError:
 from swiftdetr.evaluation.f1_sweep import sweep_confidence_thresholds
 from swiftdetr.evaluation.matching import (
     build_matching_data,
-    distributed_merge_matching_data,
     init_matching_accumulator,
     merge_matching_data,
 )
@@ -303,8 +302,8 @@ def evaluate(
         out["segm_mAP_50_95"] = float(metrics["segm_map"])
         out["segm_mAP_50"] = float(metrics["segm_map_50"])
 
-    # F1 sweep
-    merged = distributed_merge_matching_data(f1_local)
+    # F1 sweep — evaluate() only runs on rank 0, so no cross-rank gather needed
+    merged = f1_local
     if merged:
         sorted_ids = sorted(merged.keys())
         per_class_list = [merged[cid] for cid in sorted_ids]
