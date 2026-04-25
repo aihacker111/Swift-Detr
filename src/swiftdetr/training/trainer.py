@@ -296,8 +296,7 @@ def fit(
 
     # ---- Wrap with DDP ----
     if ddp_active:
-        find_unused = mc.segmentation_head  # seg head may leave params unused
-        model = DDP(model, device_ids=[_local_rank()], find_unused_parameters=find_unused)
+        model = DDP(model, device_ids=[_local_rank()], find_unused_parameters=True)
 
     # ---- DataLoaders ----
     train_loader = data.train_dataloader(world_size=world_size, rank=_rank())
