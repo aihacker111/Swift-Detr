@@ -18,6 +18,12 @@ import torch.nn.functional as F
 from torch import nn
 from torchmetrics.detection import MeanAveragePrecision
 
+try:
+    from tqdm import tqdm as _tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
 from swiftdetr.evaluation.f1_sweep import sweep_confidence_thresholds
 from swiftdetr.evaluation.matching import (
     build_matching_data,
@@ -105,7 +111,16 @@ def train_one_epoch(
     optimizer.zero_grad()
     optimizer_steps = 0
 
-    for batch_idx, (samples, targets) in enumerate(loader):
+    group_lrs = [pg["lr"] for pg in optimizer.param_groups if "lr" in pg]
+    current_lr = group_lrs[0] if group_lrs else 0.0
+
+    pbar = (
+        _tqdm(loader, desc=f"Epoch {epoch + 1} [train]", unit="batch", dynamic_ncols=True, leave=True)
+        if _HAS_TQDM
+        else loader
+    )
+
+    for batch_idx, (samples, targets) in enumerate(pbar):
         global_step = global_step_start + batch_idx
 
         # Drop-path scheduling
@@ -168,6 +183,12 @@ def train_one_epoch(
                 ema_model.update(model)
 
         total_loss += loss.item()
+        avg_loss = total_loss / (batch_idx + 1)
+
+        if _HAS_TQDM and hasattr(pbar, "set_postfix"):
+            if is_accum_step:
+                current_lr = optimizer.param_groups[0]["lr"]
+            pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{current_lr:.2e}")
 
     # Epoch-end EMA update
     if ema_model is not None:
@@ -237,8 +258,14 @@ def evaluate(
     f1_local: dict = init_matching_accumulator()
     total_loss = 0.0
 
+    val_pbar = (
+        _tqdm(loader, desc="Evaluating", unit="batch", dynamic_ncols=True, leave=False)
+        if _HAS_TQDM
+        else loader
+    )
+
     with torch.no_grad():
-        for samples, targets in loader:
+        for samples, targets in val_pbar:
             samples = samples.to(device)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
