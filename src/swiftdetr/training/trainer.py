@@ -4,330 +4,393 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-"""Trainer factory — assembles a PTL Trainer from Swift-DETR configs."""
+"""Pure PyTorch training orchestrator for Swift-DETR."""
 
-import warnings
-from typing import Any
+from __future__ import annotations
 
+import csv
+import os
+import random
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
 import torch
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar, TQDMProgressBar
-from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
-from pytorch_lightning.loggers import CSVLogger, MLFlowLogger, TensorBoardLogger, WandbLogger
-from pytorch_lightning.strategies import DDPStrategy as _DDPStrategy
-
-# _MultiProcessingLauncher is a private PTL API (leading underscore) that may change
-# in minor PTL releases within the >=2.6,<3 range.  No public equivalent exists in
-# PTL 2.x.  Monitor PTL changelogs when bumping the lower bound.
-try:
-    from pytorch_lightning.strategies.launchers.multiprocessing import _MultiProcessingLauncher
-except ImportError:  # pragma: no cover - exercised in unit tests via monkeypatch
-    _MultiProcessingLauncher = None  # type: ignore[assignment]
 
 from swiftdetr.config import ModelConfig, TrainConfig
-from swiftdetr.training.callbacks import (
-    BestModelCallback,
-    DropPathCallback,
-    SwiftDetrEarlyStopping,
-    SwiftDetrEMACallback,
-)
-from swiftdetr.training.callbacks.coco_eval import COCOEvalCallback
+from swiftdetr.datasets.coco import compute_multi_scale_scales
+from swiftdetr.training.callbacks.best_model import BestModelTracker, EarlyStoppingTracker
+from swiftdetr.training.callbacks.drop_schedule import DropPathScheduler
+from swiftdetr.training.callbacks.ema import EMAManager
+from swiftdetr.training.engine import evaluate, print_metrics_table, resolve_precision, train_one_epoch
+from swiftdetr.training.module_data import SwiftDetrData
+from swiftdetr.training.module_model import SwiftDetrWrapper
 from swiftdetr.util.logger import get_logger
 
-_logger = get_logger()
+logger = get_logger()
 
 
-# ---------------------------------------------------------------------------
-# Notebook-safe spawn-based DDP
-# ---------------------------------------------------------------------------
-# ``ddp_notebook`` maps to fork-based DDP which is fundamentally unsafe:
-# PyTorch's OpenMP thread pool (created during model construction) cannot
-# survive fork() — the worker threads become zombie handles, causing
-# "Invalid thread pool!" SIGABRT when the autograd engine initialises in
-# the forked child.
-#
-# PTL considers ``start_method="spawn"`` incompatible with interactive
-# environments and raises ``MisconfigurationException`` if used in Jupyter.
-# However, PTL's own ``_wrapping_function`` is the entry-point for spawned
-# children — no ``if __name__ == "__main__"`` guard is required — so spawn
-# is perfectly safe here.
-#
-# Classes MUST live at module level (not inside a function) so that Python's
-# pickle can serialise them for the spawned child processes.
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-if _MultiProcessingLauncher is not None:
-
-    class _InteractiveSpawnLauncher(_MultiProcessingLauncher):
-        """Spawn launcher that reports itself as interactive-compatible."""
-
-        @property
-        def is_interactive_compatible(self) -> bool:  # type: ignore[override]
-            return True
-
-else:
-    _InteractiveSpawnLauncher = None
+def _resolve_device(train_config: TrainConfig) -> torch.device:
+    accelerator = str(train_config.accelerator).lower()
+    if accelerator in {"auto", "gpu", "cuda"}:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+    if accelerator == "mps" or (accelerator == "auto" and torch.backends.mps.is_available()):
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
-class _NotebookSpawnDDPStrategy(_DDPStrategy):
-    """Spawn-based DDP strategy that works inside Jupyter / Kaggle notebooks."""
+class _CSVLogger:
+    """Minimal CSV metric logger."""
 
-    def _configure_launcher(self) -> None:
-        if self.cluster_environment is None:
-            raise RuntimeError(
-                "_NotebookSpawnDDPStrategy requires a cluster environment; "
-                "ensure the strategy is initialised through PTL's Trainer."
-            )
-        if _InteractiveSpawnLauncher is None:
-            raise RuntimeError(
-                "Notebook spawn strategy requires "
-                "pytorch_lightning.strategies.launchers.multiprocessing._MultiProcessingLauncher. "
-                "Your installed PyTorch Lightning version changed this private API; "
-                "pin/upgrade PTL to a compatible version in the supported >=2.6,<3 range."
-            )
-        self._launcher = _InteractiveSpawnLauncher(self, start_method=self._start_method)
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._writer: Optional[csv.DictWriter] = None
+        self._file = None
+        self._fieldnames: list = []
+
+    def log(self, row: dict) -> None:
+        new_keys = [k for k in row if k not in self._fieldnames]
+        if new_keys:
+            # Re-open and rewrite with updated headers if new keys appear
+            self._fieldnames.extend(new_keys)
+            if self._file is not None:
+                self._file.close()
+            self._file = open(self._path, "a", newline="")
+            self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames, extrasaction="ignore")
+            if os.path.getsize(self._path) == 0 or new_keys:
+                # Write header only once; if keys expanded, rewrite whole file
+                self._file.close()
+                # Collect existing rows
+                existing: list[dict] = []
+                if os.path.exists(self._path):
+                    with open(self._path) as f:
+                        reader = csv.DictReader(f)
+                        existing = list(reader)
+                self._file = open(self._path, "w", newline="")
+                self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames, extrasaction="ignore")
+                self._writer.writeheader()
+                for r in existing:
+                    self._writer.writerow(r)
+
+        if self._file is None:
+            self._file = open(self._path, "a", newline="")
+            self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames, extrasaction="ignore")
+            if os.path.getsize(self._path) == 0:
+                self._writer.writeheader()
+
+        self._writer.writerow(row)
+        self._file.flush()
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
-def build_trainer(
-    train_config: TrainConfig,
-    model_config: ModelConfig,
-    *,
-    accelerator: str | None = None,
-    **trainer_kwargs: Any,
-) -> Trainer:
-    """Assemble a PTL ``Trainer`` with the full Swift-DETR callback and logger stack.
+def _save_checkpoint(
+    output_dir: Path,
+    filename: str,
+    model_state_dict: dict,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    epoch: int,
+    global_step: int,
+    ema_state_dict: Optional[dict],
+    args_dict: object,
+    model_name: Optional[str] = None,
+) -> None:
+    path = output_dir / filename
+    payload: dict = {
+        "model": model_state_dict,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "args": args_dict,
+    }
+    if ema_state_dict is not None:
+        payload["ema_model"] = ema_state_dict
+    if model_name is not None:
+        payload["model_name"] = model_name
+    torch.save(payload, path)
 
-    Resolves training precision from ``model_config.amp`` and device capability,
-    guards EMA against sharded strategies, wires conditional loggers, and applies
-    promoted training knobs (gradient clipping, sync_batchnorm, strategy).
+
+def _load_resume_checkpoint(
+    path: str,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler,
+) -> int:
+    """Load a checkpoint for resume; returns the starting epoch."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+    # Determine where model weights live
+    if "model" in ckpt:
+        state_dict = ckpt["model"]
+    elif "state_dict" in ckpt:
+        raw = {k[len("model."):]: v for k, v in ckpt["state_dict"].items() if k.startswith("model.")}
+        state_dict = raw if raw else {}
+    else:
+        state_dict = ckpt
+
+    model_for_load = getattr(model, "_orig_mod", model)
+    model_for_load.load_state_dict(state_dict, strict=False)
+
+    start_epoch = int(ckpt.get("epoch", 0)) + 1
+
+    if optimizer is not None and "optimizer" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception as exc:
+            logger.warning("Could not restore optimizer state: %s", exc)
+
+    if scheduler is not None and "scheduler" in ckpt:
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except Exception as exc:
+            logger.warning("Could not restore scheduler state: %s", exc)
+
+    logger.info("Resumed from %s (epoch %d → start %d)", path, ckpt.get("epoch", 0), start_epoch)
+    return start_epoch
+
+
+def fit(
+    wrapper: SwiftDetrWrapper,
+    data: SwiftDetrData,
+    output_dir: str,
+    resume: Optional[str] = None,
+    fast_dev_run: Optional[int] = None,
+) -> None:
+    """Full training loop — pure PyTorch, no Lightning.
 
     Args:
-        train_config: Training hyperparameter configuration.
-        model_config: Architecture configuration (used for precision and segmentation).
-        accelerator: PTL accelerator string (e.g. ``"auto"``, ``"cpu"``, ``"gpu"``).
-            Defaults to ``None`` which reads from ``train_config.accelerator``
-            (itself defaulting to ``"auto"``).
-            Pass ``"cpu"`` to override auto-detection (e.g. when the caller
-            explicitly requests CPU training via ``device="cpu"``).
-        **trainer_kwargs: Extra keyword arguments forwarded verbatim to
-            ``pytorch_lightning.Trainer``.  Use this to pass PTL-native flags
-            that are not exposed through ``TrainConfig``, for example::
-
-                build_trainer(tc, mc, fast_dev_run=2)
-
-            Any key present in both ``trainer_kwargs`` and the built config dict
-            will be overridden by the value in ``trainer_kwargs``.
-
-    Returns:
-        A configured ``pytorch_lightning.Trainer`` instance.
+        wrapper: Model wrapper (model, criterion, postprocess).
+        data: Data module (datasets + dataloaders + kornia pipeline).
+        output_dir: Where checkpoints and logs are written.
+        resume: Optional path to a checkpoint to resume from.
+        fast_dev_run: If set, run only this many batches per epoch (sanity check).
     """
-    tc = train_config
-    if accelerator is None:
-        accelerator = tc.accelerator
+    tc = wrapper.train_config
+    mc = wrapper.model_config
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    # --- Precision resolution ---
-    def _resolve_precision() -> str:
-        if not model_config.amp:
-            return "32-true"
-        # Ampere+ GPUs support bf16-mixed which is scaler-free —
-        # no GradScaler.scale/unscale/update overhead per optimizer step.
-        # BF16 is safe for fine-tuning (pretrained weights loaded by default).
-        # Training from random init with very small LR may underflow; callers
-        # can override via trainer_kwargs(precision="16-mixed") if needed.
-        #
-        # Note: torch.cuda.is_available() and torch.cuda.is_bf16_supported() both
-        # create a CUDA driver context in the parent process.  This is intentional
-        # and safe for the multi-process launch modes we rely on here because we
-        # avoid fork-based launching in notebook contexts (see
-        # _NotebookSpawnDDPStrategy above), and spawn/subprocess-based launchers
-        # start child processes with a fresh CUDA state regardless of what the
-        # parent has initialised. If a fork-based path is ever added, this
-        # precision check must be moved into the child process.
-        if torch.cuda.is_available():
-            if torch.cuda.is_bf16_supported():
-                return "bf16-mixed"
-            return "16-mixed"
-        if torch.backends.mps.is_available():
-            return "16-mixed"
-        return "32-true"
+    # Seed
+    if tc.seed is not None:
+        _seed_everything(tc.seed)
 
-    # --- Strategy + EMA sharding guard ---
-    strategy = tc.strategy
+    # Device + precision
+    device = _resolve_device(tc)
+    precision = resolve_precision(mc)
+    scaler: Optional[torch.amp.GradScaler] = None
+    if precision == "fp16":
+        scaler = torch.amp.GradScaler(device=device.type)
+    logger.info("Device: %s | Precision: %s", device, precision)
 
-    # Transparently replace fork-based DDP with spawn-based DDP — see the
-    # module-level comment block above _InteractiveSpawnLauncher for rationale.
-    if strategy in ("ddp_notebook", "ddp_spawn"):
-        strategy = _NotebookSpawnDDPStrategy(start_method="spawn", find_unused_parameters=True)
-        _logger.info(
-            "%s → spawn-based DDP to avoid OpenMP thread pool corruption after fork.",
-            tc.strategy,
-        )
-    elif strategy == "ddp" and model_config.segmentation_head:
-        # The segmentation head's sparse_forward() returns dict intermediates and
-        # leaves some parameters unused on certain forward steps, causing DDP to
-        # raise "It looks like your LightningModule has parameters that were not
-        # used in producing the loss" with plain ddp.  Enabling
-        # find_unused_parameters lets DDP traverse the autograd graph after each
-        # backward pass to detect which parameters contributed to the loss.
-        strategy = _DDPStrategy(find_unused_parameters=True)
-        _logger.info(
-            "segmentation_head=True with strategy='ddp' → DDPStrategy(find_unused_parameters=True).",
-        )
-    sharded = any(s in str(strategy).lower() for s in ("fsdp", "deepspeed"))
-    enable_ema = bool(tc.use_ema) and not sharded
-    if tc.use_ema and sharded:
-        warnings.warn(
-            f"EMA disabled: SwiftDetrEMACallback is not compatible with sharded strategies "
-            f"(strategy={strategy!r}). Set use_ema=False to suppress this warning.",
-            UserWarning,
-            stacklevel=2,
-        )
+    # cuDNN
+    torch.backends.cudnn.benchmark = False
 
-    # --- Build callbacks ---
-    callbacks = []
+    # Move model to device
+    wrapper.to(device)
+    model = wrapper.model
+    criterion = wrapper.criterion
+    postprocess = wrapper.postprocess
 
-    if tc.progress_bar == "rich":
-        callbacks.append(RichProgressBar(theme=RichProgressBarTheme(metrics_format=".3e")))
-    elif tc.progress_bar == "tqdm":
-        callbacks.append(TQDMProgressBar())
+    # DataLoaders
+    train_loader = data.train_dataloader(world_size=1)
+    val_loader = data.val_dataloader()
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = steps_per_epoch * tc.epochs
 
-    if enable_ema:
-        callbacks.append(
-            SwiftDetrEMACallback(
-                decay=tc.ema_decay,
-                tau=tc.ema_tau,
-                update_interval_steps=tc.ema_update_interval,
-            )
-        )
+    # Optimizer + scheduler
+    optimizer, scheduler = wrapper.build_optimizer_and_scheduler(total_steps, steps_per_epoch)
 
-    # Drop-path / dropout scheduling (vit_encoder_num_layers defaults to 12).
+    # Resume
+    start_epoch = 0
+    if resume:
+        start_epoch = _load_resume_checkpoint(resume, model, optimizer, scheduler)
+
+    # EMA
+    ema_manager: Optional[EMAManager] = None
+    if tc.use_ema:
+        raw_model = getattr(model, "_orig_mod", model)
+        ema_manager = EMAManager(raw_model, decay=tc.ema_decay, tau=tc.ema_tau, device=device)
+
+    # Drop-path scheduler
+    dp_scheduler: Optional[DropPathScheduler] = None
     if tc.drop_path > 0.0:
-        callbacks.append(DropPathCallback(drop_path=tc.drop_path))
+        dp_scheduler = DropPathScheduler(drop_path=tc.drop_path)
+        dp_scheduler.build(tc.epochs, steps_per_epoch)
 
-    # COCO mAP + F1 evaluation.
-    callbacks.append(
-        COCOEvalCallback(
-            max_dets=tc.eval_max_dets,
-            segmentation=model_config.segmentation_head,
-            eval_interval=tc.eval_interval,
-            log_per_class_metrics=tc.log_per_class_metrics,
+    # Multi-scale
+    scales = []
+    if tc.multi_scale:
+        scales = compute_multi_scale_scales(mc.resolution, tc.expanded_scales, mc.patch_size, mc.num_windows)
+
+    # Trackers
+    best_tracker = BestModelTracker(output_dir, use_ema=tc.use_ema)
+    early_stopper: Optional[EarlyStoppingTracker] = (
+        EarlyStoppingTracker(
+            patience=tc.early_stopping_patience,
+            min_delta=tc.early_stopping_min_delta,
+            use_ema=tc.early_stopping_use_ema,
         )
+        if tc.early_stopping
+        else None
     )
 
-    # Latest resume checkpoint — overwritten every epoch.
-    # Skip when checkpoint_interval == 1 to avoid duplicate ModelCheckpoint state_key.
-    if tc.checkpoint_interval != 1:
-        callbacks.append(
-            ModelCheckpoint(
-                dirpath=tc.output_dir,
-                filename="last",
-                every_n_epochs=1,
-                save_top_k=1,
-                enable_version_counter=False,
-                auto_insert_metric_name=False,
-                verbose=False,
-            )
-        )
+    # Logging
+    csv_logger = _CSVLogger(str(output_path / "metrics.csv"))
+    cat_id_to_name = data.cat_id_to_name
+    class_names = data.class_names
 
-    # Interval archive checkpoints — kept for the full run.
-    callbacks.append(
-        ModelCheckpoint(
-            dirpath=tc.output_dir,
-            filename="checkpoint_{epoch}",
-            every_n_epochs=tc.checkpoint_interval,
-            save_top_k=-1,
-            enable_version_counter=False,
-            auto_insert_metric_name=False,
-            verbose=False,
-        )
+    # Resolve args_dict for checkpoint payloads
+    train_config_dump = tc.model_dump() if hasattr(tc, "model_dump") else {}
+    if class_names and not train_config_dump.get("class_names"):
+        train_config_dump = {**train_config_dump, "class_names": class_names}
+
+    model_name: Optional[str] = None
+    config_type = type(mc).__name__
+    if config_type.startswith("SwiftDetr") and config_type.endswith("Config"):
+        model_name = config_type.removesuffix("Config")
+
+    global_step = start_epoch * steps_per_epoch
+
+    logger.info(
+        "Starting training: epochs=%d start=%d steps/epoch=%d",
+        tc.epochs, start_epoch, steps_per_epoch,
     )
 
-    # Best-model checkpointing — monitor EMA metric only when EMA is active.
-    callbacks.append(
-        BestModelCallback(
-            output_dir=tc.output_dir,
-            monitor_ema="val/ema_mAP_50_95" if enable_ema else None,
-            run_test=tc.run_test,
+    for epoch in range(start_epoch, tc.epochs):
+        logger.info("Epoch %d/%d", epoch + 1, tc.epochs)
+
+        dp_schedule = dp_scheduler.dp_schedule if dp_scheduler is not None else None
+
+        train_metrics = train_one_epoch(
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            loader=train_loader,
+            device=device,
+            epoch=epoch,
+            grad_accum=tc.grad_accum_steps,
+            clip_max_norm=tc.clip_max_norm,
+            precision=precision,
+            scaler=scaler,
+            ema_model=ema_manager,
+            dp_schedule=dp_schedule,
+            global_step_start=global_step,
+            multi_scale=tc.multi_scale,
+            scales=scales,
+            do_random_resize_via_padding=tc.do_random_resize_via_padding,
+            kornia_pipeline=data._kornia_pipeline,
+            kornia_normalize=data._kornia_normalize,
+            ema_update_interval=tc.ema_update_interval,
         )
-    )
+        global_step += steps_per_epoch
 
-    # Optional early stopping.
-    if tc.early_stopping:
-        callbacks.append(
-            SwiftDetrEarlyStopping(
-                patience=tc.early_stopping_patience,
-                min_delta=tc.early_stopping_min_delta,
-                use_ema=tc.early_stopping_use_ema,
-            )
+        logger.info(
+            "  train | loss=%.4f lr=%.6f",
+            train_metrics["loss"], train_metrics["lr"],
         )
 
-    # --- Build loggers ---
-    # Each logger is guarded by a try/except because tensorboard, wandb, and mlflow
-    # are optional dependencies (installed via the [metrics] extra).  A missing dep
-    # emits a UserWarning instead of crashing.
-    # CSVLogger is always enabled — no extra package required.
-    # Produces metrics.csv in output_dir so there is always a log file.
-    loggers: list = [CSVLogger(save_dir=tc.output_dir, name="", version="")]
+        row: dict = {"epoch": epoch, **{f"train/{k}": v for k, v in train_metrics.items()}}
 
-    if tc.tensorboard:
-        try:
-            loggers.append(
-                TensorBoardLogger(
-                    save_dir=tc.output_dir,
-                    name="",
-                    version="",
-                )
+        # Validation
+        run_eval = (
+            fast_dev_run is not None
+            or (epoch + 1) % tc.eval_interval == 0
+            or epoch + 1 == tc.epochs
+        )
+        val_metrics: dict = {}
+        ema_metrics: dict = {}
+
+        if run_eval:
+            val_metrics = evaluate(
+                model=model,
+                postprocess=postprocess,
+                loader=val_loader,
+                device=device,
+                cat_id_to_name=cat_id_to_name,
+                max_dets=tc.eval_max_dets,
+                segmentation=mc.segmentation_head,
+                criterion=criterion,
+                weight_dict=criterion.weight_dict,
+                compute_loss=tc.compute_val_loss,
             )
-        except ModuleNotFoundError as exc:
-            _logger.warning("TensorBoard logging disabled: %s. Install with: pip install tensorboard", exc)
-
-    if tc.wandb:
-        try:
-            loggers.append(
-                WandbLogger(
-                    name=tc.run,
-                    project=tc.project,
-                    save_dir=tc.output_dir,
-                )
+            print_metrics_table("val", val_metrics)
+            logger.info(
+                "  val   | mAP50:95=%.4f mAP50=%.4f F1=%.4f",
+                val_metrics.get("mAP_50_95", 0),
+                val_metrics.get("mAP_50", 0),
+                val_metrics.get("F1", 0),
             )
-        except ModuleNotFoundError as exc:
-            _logger.warning("WandB logging disabled: %s. Install with: pip install wandb", exc)
+            row.update({f"val/{k}": v for k, v in val_metrics.items()})
 
-    if tc.mlflow:
-        try:
-            loggers.append(
-                MLFlowLogger(
-                    experiment_name=tc.project or "swiftdetr",
-                    run_name=tc.run,
-                    save_dir=tc.output_dir,
+            if ema_manager is not None:
+                ema_model = ema_manager.module
+                ema_model.eval()
+                ema_metrics = evaluate(
+                    model=ema_model,
+                    postprocess=postprocess,
+                    loader=val_loader,
+                    device=device,
+                    cat_id_to_name=cat_id_to_name,
+                    max_dets=tc.eval_max_dets,
+                    segmentation=mc.segmentation_head,
                 )
+                print_metrics_table("val (EMA)", ema_metrics)
+                row.update({f"val/ema_{k}": v for k, v in ema_metrics.items()})
+
+        csv_logger.log(row)
+
+        # Checkpointing
+        model_sd = wrapper.state_dict()
+        ema_sd = ema_manager.state_dict() if ema_manager is not None else None
+
+        _save_checkpoint(
+            output_path, "last.pth",
+            model_sd, optimizer, scheduler,
+            epoch, global_step, ema_sd,
+            train_config_dump, model_name,
+        )
+        if (epoch + 1) % tc.checkpoint_interval == 0:
+            _save_checkpoint(
+                output_path, f"checkpoint_{epoch}.pth",
+                model_sd, optimizer, scheduler,
+                epoch, global_step, ema_sd,
+                train_config_dump, model_name,
             )
-        except ModuleNotFoundError as exc:
-            _logger.warning("MLflow logging disabled: %s. Install with: pip install mlflow", exc)
 
-    if tc.clearml:
-        raise NotImplementedError("ClearML logging is not yet supported. Remove clearml=True from TrainConfig.")
+        if run_eval and val_metrics:
+            combined_metrics = {**val_metrics}
+            if ema_metrics:
+                combined_metrics["ema_mAP_50_95"] = ema_metrics.get("mAP_50_95", 0.0)
+            best_tracker.update(
+                combined_metrics, model_sd, train_config_dump,
+                epoch, global_step, ema_sd, model_name,
+            )
 
-    # --- Promoted config fields (T4-2 added these to TrainConfig) ---
-    clip_max_norm: float = tc.clip_max_norm
-    sync_bn: bool = tc.sync_bn
+            if early_stopper is not None:
+                early_stopper.update(combined_metrics)
+                if early_stopper.should_stop:
+                    logger.info("Early stopping at epoch %d.", epoch + 1)
+                    break
 
-    trainer_config: dict[str, Any] = {
-        "max_epochs": tc.epochs,
-        "accelerator": accelerator,
-        "devices": tc.devices,
-        "num_nodes": tc.num_nodes,
-        "strategy": strategy,
-        "precision": _resolve_precision(),
-        "accumulate_grad_batches": tc.grad_accum_steps,
-        "gradient_clip_val": clip_max_norm,
-        "sync_batchnorm": sync_bn,
-        "callbacks": callbacks,
-        "logger": loggers if loggers else False,
-        "enable_progress_bar": tc.progress_bar is not None,
-        "default_root_dir": tc.output_dir,
-        "log_every_n_steps": 50,
-        "deterministic": False,
-    }
-    trainer_config.update(trainer_kwargs)
-    return Trainer(**trainer_config)
+        if fast_dev_run is not None:
+            logger.info("fast_dev_run=%d: stopping after 1 epoch.", fast_dev_run)
+            break
+
+    best_tracker.finalize()
+    csv_logger.close()
+    logger.info("Training complete. Outputs at: %s", output_dir)

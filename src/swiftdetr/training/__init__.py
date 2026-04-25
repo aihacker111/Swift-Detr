@@ -4,45 +4,40 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-"""Swift-DETR training package (PyTorch Lightning).
-
-Provides the Lightning module, data module, callbacks, and CLI for
-training and evaluation.
+"""Swift-DETR training package (pure PyTorch, no Lightning).
 
 Exports:
-    SwiftDetrModule: LightningModule wrapping the Swift-DETR model and training loop.
-    SwiftDetrDataModule: LightningDataModule wrapping dataset construction and loaders.
-    build_trainer: Factory that assembles a PTL Trainer from Swift-DETR configs.
+    SwiftDetrWrapper: Model wrapper (model + criterion + postprocess).
+    SwiftDetrData: Dataset and dataloader builder.
+    fit: Main training orchestrator.
+    BestModelTracker: Saves best checkpoints.
+    DropPathScheduler: Per-step drop-path schedule.
+    EarlyStoppingTracker: Patience-based early stopping.
+    EMAManager: Exponential moving average manager.
+    convert_legacy_checkpoint: Convert legacy .pth checkpoints.
 """
 
-from pytorch_lightning import seed_everything
-
 from swiftdetr.training.callbacks import (
-    BestModelCallback,
-    COCOEvalCallback,
-    DropPathCallback,
-    SwiftDetrEarlyStopping,
-    SwiftDetrEMACallback,
+    BestModelTracker,
+    DropPathScheduler,
+    EarlyStoppingTracker,
+    EMAManager,
 )
 from swiftdetr.training.checkpoint import convert_legacy_checkpoint
-from swiftdetr.training.cli import SwiftDetrCli
-from swiftdetr.training.module_data import SwiftDetrDataModule
-from swiftdetr.training.module_model import SwiftDetrModule
-from swiftdetr.training.trainer import build_trainer
+from swiftdetr.training.module_data import SwiftDetrData
+from swiftdetr.training.module_model import SwiftDetrWrapper
+from swiftdetr.training.trainer import fit
 from swiftdetr.util.logger import get_logger
 
 _logger = get_logger()
 
 __all__ = [
-    "BestModelCallback",
-    "COCOEvalCallback",
-    "DropPathCallback",
-    "SwiftDetrCli",
-    "SwiftDetrDataModule",
-    "SwiftDetrEMACallback",
-    "SwiftDetrEarlyStopping",
-    "SwiftDetrModule",
-    "build_trainer",
+    "BestModelTracker",
+    "DropPathScheduler",
+    "EarlyStoppingTracker",
+    "EMAManager",
+    "SwiftDetrData",
+    "SwiftDetrWrapper",
     "convert_legacy_checkpoint",
-    "seed_everything",
+    "fit",
 ]

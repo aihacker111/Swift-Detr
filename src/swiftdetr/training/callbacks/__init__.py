@@ -4,17 +4,15 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-"""Lightning callbacks for Swift-DETR training."""
+"""Pure-PyTorch training helpers (formerly Lightning callbacks)."""
 
-from swiftdetr.training.callbacks.best_model import BestModelCallback, SwiftDetrEarlyStopping
-from swiftdetr.training.callbacks.coco_eval import COCOEvalCallback
-from swiftdetr.training.callbacks.drop_schedule import DropPathCallback
-from swiftdetr.training.callbacks.ema import SwiftDetrEMACallback
+from swiftdetr.training.callbacks.best_model import BestModelTracker, EarlyStoppingTracker
+from swiftdetr.training.callbacks.drop_schedule import DropPathScheduler
+from swiftdetr.training.callbacks.ema import EMAManager
 
 __all__ = [
-    "BestModelCallback",
-    "COCOEvalCallback",
-    "DropPathCallback",
-    "SwiftDetrEMACallback",
-    "SwiftDetrEarlyStopping",
+    "BestModelTracker",
+    "DropPathScheduler",
+    "EarlyStoppingTracker",
+    "EMAManager",
 ]
