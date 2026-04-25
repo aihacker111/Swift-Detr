@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "swiftdetr"
+version = "0.1.0"
+description = "Swift-DETR: Lightweight real-time object detection with SwiftNet backbone and DETR transformer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "torch>=2.2.0,<3.0.0",
+    "torchvision>=0.17.0",
+    "supervision>=0.19.0",
+    "pydantic>=2.0,<3",
+    "pyDeprecate",
+    "numpy",
+    "pillow",
+    "requests",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+train = [
+    "pytorch-lightning>=2.6",
+    "torchmetrics",
+    "albumentations>=1.3.0",
+    "pycocotools",
+    "roboflow",
+]
+kornia = [
+    "kornia>=0.7,<1",
+]
+onnx = [
+    "onnx>=1.16.0",
+    "onnxruntime",
+]
+loggers = [
+    "tensorboard",
+    "wandb",
+    "mlflow",
+]
+
+[project.scripts]
+swiftdetr = "swiftdetr.training.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swiftdetr"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "configs/", "README.md"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501", "N812", "N803", "N806"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: marks tests that require a GPU"]
+
+[tool.coverage.run]
+source = ["swiftdetr"]
+omit = ["tests/*"]

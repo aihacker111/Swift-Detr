@@ -1,0 +1,47 @@
+# Swift-DETR Small — balanced speed / accuracy
+# Backbone: SwiftNet-Small (~15M params, dims=[48,96,192,384])
+# Transformer: 256-dim, 3 decoder layers, 300 queries
+# Input: 640×640 (divisible by 32)
+
+model:
+  model_config:
+    class_path: swiftdetr.config.SwiftDetrSmallConfig
+    init_args:
+      num_classes: 80          # COCO (set to your dataset class count)
+
+  train_config:
+    class_path: swiftdetr.config.TrainConfig
+    init_args:
+      dataset_dir: /data/coco       # path to your dataset root
+      output_dir: output/swiftdetr_small
+      epochs: 100
+      batch_size: 8
+      grad_accum_steps: 4           # effective batch = 32
+      num_workers: 4
+
+      # Optimiser
+      lr: 1.0e-4
+      lr_encoder: 1.5e-4
+      lr_vit_layer_decay: 0.8
+      lr_component_decay: 0.7
+      weight_decay: 1.0e-4
+      clip_max_norm: 0.1
+      lr_drop: 80
+      lr_scheduler: step
+
+      # Augmentation
+      multi_scale: true
+      expanded_scales: true
+      augmentation_backend: cpu
+
+      # EMA
+      use_ema: true
+      ema_decay: 0.993
+      ema_tau: 100
+
+      # Logging
+      tensorboard: true
+      wandb: false
+      checkpoint_interval: 10
+      eval_interval: 1
+      log_per_class_metrics: false
