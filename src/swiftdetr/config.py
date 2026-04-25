@@ -275,6 +275,7 @@ class TrainConfig(BaseModel):
     pin_memory: Optional[bool] = None
     persistent_workers: Optional[bool] = None
     prefetch_factor: Optional[int] = None
+    debug_limit_data: Optional[int] = Field(default=None, ge=1)
 
     @field_validator("batch_size", mode="after")
     @classmethod

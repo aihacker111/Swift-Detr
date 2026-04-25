@@ -95,6 +95,8 @@ def parse_args() -> argparse.Namespace:
                    help="Resume training from this checkpoint path (.pth or .ckpt).")
     p.add_argument("--fast-dev-run", type=int, default=None, metavar="N",
                    help="Run N train/val batches only (sanity check).")
+    p.add_argument("--debug-limit-data", type=int, default=None, metavar="N",
+                   help="Limit train and val to N batches per epoch (for quick code testing).")
     p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
@@ -131,6 +133,8 @@ def main() -> None:
     }
     if args.aug_preset != "default":
         train_kwargs["aug_config"] = _AUG_PRESET[args.aug_preset]
+    if args.debug_limit_data is not None:
+        train_kwargs["debug_limit_data"] = args.debug_limit_data
     train_config = TrainConfig(**train_kwargs)
 
     wrapper = SwiftDetrWrapper(model_config, train_config)

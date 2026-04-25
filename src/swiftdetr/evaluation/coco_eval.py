@@ -25,13 +25,14 @@ https://github.com/pytorch/vision/blob/edfd5a7/references/detection/coco_eval.py
 import contextlib
 import copy
 import os
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pycocotools.mask as mask_util
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
+from swiftdetr.evaluation.f1_sweep import sweep_confidence_thresholds
 from swiftdetr.util.distributed import all_gather
 from swiftdetr.util.logger import get_logger
 
@@ -110,11 +111,21 @@ class CocoEvaluator:
 
             self.eval_imgs[iou_type].append(eval_imgs)
 
-    def synchronize_between_processes(self) -> None:
-        """Merge eval results across distributed processes."""
+    def synchronize_between_processes(self, distribute: bool = True) -> None:
+        """Merge eval results across distributed processes.
+
+        Args:
+            distribute: If True, use all_gather to collect results from all
+                DDP ranks (standard distributed eval). If False, merge only
+                local data — use this when only one rank runs evaluation
+                (e.g. EMA eval on rank 0 only).
+        """
         for iou_type in self.iou_types:
             self.eval_imgs[iou_type] = np.concatenate(self.eval_imgs[iou_type], 2)
-            create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
+            if distribute:
+                create_common_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
+            else:
+                _local_coco_eval(self.coco_eval[iou_type], self.img_ids, self.eval_imgs[iou_type])
 
     def accumulate(self) -> None:
         """Accumulate per-image evaluation results into mean metrics."""
@@ -375,3 +386,109 @@ def patched_pycocotools_summarize(self: COCOeval) -> None:
     elif iou_type == "keypoints":
         summarize = _summarizeKps
     self.stats = summarize()
+
+
+def _local_coco_eval(coco_eval: COCOeval, img_ids: list[int], eval_imgs: Any) -> None:
+    """Populate a COCOeval object from local (single-rank) data without all_gather."""
+    eval_imgs_flat = list(eval_imgs.flatten())
+    img_ids_sorted = list(np.unique(np.array(img_ids)))
+    coco_eval.evalImgs = eval_imgs_flat
+    coco_eval.params.imgIds = img_ids_sorted
+    coco_eval._paramsEval = copy.deepcopy(coco_eval.params)
+
+
+def coco_extended_metrics(coco_eval: COCOeval) -> dict[str, Any]:
+    """Compute per-class AP table and F1/precision/recall from a finished COCOeval.
+
+    Must be called after ``coco_eval.accumulate()``.
+
+    Returns a dict with keys:
+        - ``"mAP_50_95"``, ``"mAP_50"``, ``"mAP_75"``, ``"mAR"``
+        - ``"F1"``, ``"precision"``, ``"recall"``
+        - ``"AP/{class_name}"`` per class
+        - ``"ap_per_class_markdown"`` — markdown table string
+    """
+    iou50_idx = int(np.argwhere(np.isclose(coco_eval.params.iouThrs, 0.50)).item())
+    cat_ids = coco_eval.params.catIds
+    area_idx = 0
+    maxdet_idx = 2
+
+    # Unflatten evalImgs into nested dict: cat_id → area_rng → img_id → e
+    evalImgs_unflat: dict = {}
+    for e in coco_eval.evalImgs:
+        if e is None:
+            continue
+        cid = e["category_id"]
+        arng = tuple(e["aRng"])
+        iid = e["image_id"]
+        evalImgs_unflat.setdefault(cid, {}).setdefault(arng, {})[iid] = e
+
+    area_rng_all = tuple(coco_eval.params.areaRng[area_idx])
+
+    per_class_data = []
+    for cid in cat_ids:
+        dt_scores: list = []
+        dt_matches: list = []
+        dt_ignore: list = []
+        total_gt = 0
+        for img_id in coco_eval.params.imgIds:
+            e = evalImgs_unflat.get(cid, {}).get(area_rng_all, {}).get(img_id)
+            if e is None:
+                continue
+            gt_ignore = e["gtIgnore"]
+            total_gt += sum(1 for ig in gt_ignore if not ig)
+            for d in range(len(e["dtIds"])):
+                dt_scores.append(e["dtScores"][d])
+                dt_matches.append(e["dtMatches"][iou50_idx, d])
+                dt_ignore.append(e["dtIgnore"][iou50_idx, d])
+        per_class_data.append({
+            "scores": np.array(dt_scores, dtype=np.float32),
+            "matches": np.array(dt_matches),
+            "ignore": np.array(dt_ignore, dtype=bool),
+            "total_gt": total_gt,
+        })
+
+    classes_with_gt = [k for k in range(len(cat_ids)) if per_class_data[k]["total_gt"] > 0]
+    conf_thresholds = np.linspace(0.0, 1.0, 101)
+    sweep_results = sweep_confidence_thresholds(per_class_data, conf_thresholds, classes_with_gt)
+    best = max(sweep_results, key=lambda x: x["macro_f1"])
+
+    stats = coco_eval.stats
+    mAP_50_95 = float(stats[0])
+    mAP_50    = float(stats[1])
+    mAP_75    = float(stats[2])
+    mAR       = float(stats[8])
+
+    cat_id_to_name = {c["id"]: c["name"] for c in coco_eval.cocoGt.loadCats(cat_ids)}
+
+    out: dict[str, Any] = {
+        "mAP_50_95": mAP_50_95,
+        "mAP_50":    mAP_50,
+        "mAP_75":    mAP_75,
+        "mAR":       mAR,
+        "F1":        float(best["macro_f1"]),
+        "precision": float(best["macro_precision"]),
+        "recall":    float(best["macro_recall"]),
+    }
+
+    # Per-class AP (50:95 and 50)
+    per_class_rows = []
+    for k, cid in enumerate(cat_ids):
+        p_slice = coco_eval.eval["precision"][:, :, k, area_idx, maxdet_idx]
+        p_masked = np.where(p_slice > -1, p_slice, np.nan)
+        ap_50_95 = float(np.nanmean(np.nanmean(p_masked, axis=1)))
+        ap_50 = float(np.nanmean(p_masked[iou50_idx]))
+        if np.isnan(ap_50_95) or np.isnan(ap_50):
+            continue
+        name = cat_id_to_name.get(int(cid), str(cid))
+        out[f"AP/{name}"] = ap_50_95
+        per_class_rows.append({"class": name, "ap50_95": ap_50_95, "ap50": ap_50})
+
+    per_class_rows.sort(key=lambda r: r["ap50_95"], reverse=True)
+    lines = ["| rank | class | ap50_95 | ap50 |", "| --- | --- | ---: | ---: |"]
+    for rank, row in enumerate(per_class_rows, 1):
+        lines.append(f"| {rank} | {row['class']} | {row['ap50_95']:.4f} | {row['ap50']:.4f} |")
+    lines.append(f"| all | all | {mAP_50_95:.4f} | {mAP_50:.4f} |")
+    out["ap_per_class_markdown"] = "\n".join(lines)
+
+    return out

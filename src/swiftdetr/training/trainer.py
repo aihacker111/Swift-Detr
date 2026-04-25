@@ -300,7 +300,7 @@ def fit(
 
     # ---- DataLoaders ----
     train_loader = data.train_dataloader(world_size=world_size, rank=_rank())
-    val_loader = data.val_dataloader()
+    val_loader = data.val_dataloader(world_size=world_size, rank=_rank())
 
     steps_per_epoch = max(1, len(train_loader))
     total_steps = steps_per_epoch * tc.epochs
@@ -349,8 +349,10 @@ def fit(
             )
         csv_logger = _CSVLogger(str(output_path / "metrics.csv"))
 
+    coco_gt = data.coco_gt
     cat_id_to_name = data.cat_id_to_name
     class_names = data.class_names
+    debug_limit_batches = tc.debug_limit_data
 
     train_config_dump = tc.model_dump() if hasattr(tc, "model_dump") else {}
     if class_names and not train_config_dump.get("class_names"):
@@ -402,6 +404,7 @@ def fit(
             kornia_pipeline=data._kornia_pipeline,
             kornia_normalize=data._kornia_normalize,
             ema_update_interval=tc.ema_update_interval,
+            debug_limit_batches=debug_limit_batches,
         )
         global_step += steps_per_epoch
 
@@ -413,7 +416,7 @@ def fit(
 
         row: dict = {"epoch": epoch, **{f"train/{k}": v for k, v in train_metrics.items()}}
 
-        # ---- Validation (rank-0 only to avoid duplicate metric computation) ----
+        # ---- Validation — all ranks evaluate their shard in parallel ----
         run_eval = (
             fast_dev_run is not None
             or (epoch + 1) % tc.eval_interval == 0
@@ -422,44 +425,55 @@ def fit(
         val_metrics: dict = {}
         ema_metrics: dict = {}
 
-        if run_eval and is_main:
-            # Unwrap DDP for evaluation (model already in eval-compatible state)
+        if run_eval:
+            # All ranks participate; torchmetrics + distributed_merge_matching_data
+            # handle cross-rank aggregation internally via all_gather.
             eval_model = getattr(model, "module", model)
             val_metrics = evaluate(
                 model=eval_model,
                 postprocess=postprocess,
                 loader=val_loader,
                 device=device,
-                cat_id_to_name=cat_id_to_name,
+                coco_gt=coco_gt,
                 max_dets=tc.eval_max_dets,
                 segmentation=mc.segmentation_head,
                 criterion=criterion,
                 weight_dict=criterion.weight_dict,
                 compute_loss=tc.compute_val_loss,
+                distribute=ddp_active,
+                debug_limit_batches=debug_limit_batches,
             )
-            print_metrics_table("val", val_metrics)
-            logger.info(
-                "  val   | mAP50:95=%.4f mAP50=%.4f F1=%.4f",
-                val_metrics.get("mAP_50_95", 0),
-                val_metrics.get("mAP_50", 0),
-                val_metrics.get("F1", 0),
-            )
-            row.update({f"val/{k}": v for k, v in val_metrics.items()})
+            if is_main:
+                print_metrics_table("val", val_metrics)
+                logger.info(
+                    "  val   | mAP50:95=%.4f mAP50=%.4f F1=%.4f",
+                    val_metrics.get("mAP_50_95", 0),
+                    val_metrics.get("mAP_50", 0),
+                    val_metrics.get("F1", 0),
+                )
+                row.update({f"val/{k}": v for k, v in val_metrics.items() if not isinstance(v, str)})
 
-            if ema_manager is not None:
+            # EMA exists only on rank 0 — barrier so rank 1 waits, then evaluate
+            # locally (distribute=False avoids all_gather with only rank 0 active).
+            _barrier()
+            if is_main and ema_manager is not None:
                 ema_model = ema_manager.module
                 ema_model.eval()
+                ema_val_loader = data.val_dataloader(world_size=1, rank=0)
                 ema_metrics = evaluate(
                     model=ema_model,
                     postprocess=postprocess,
-                    loader=val_loader,
+                    loader=ema_val_loader,
                     device=device,
-                    cat_id_to_name=cat_id_to_name,
+                    coco_gt=coco_gt,
                     max_dets=tc.eval_max_dets,
                     segmentation=mc.segmentation_head,
+                    distribute=False,
+                    debug_limit_batches=debug_limit_batches,
                 )
                 print_metrics_table("val (EMA)", ema_metrics)
-                row.update({f"val/ema_{k}": v for k, v in ema_metrics.items()})
+                row.update({f"val/ema_{k}": v for k, v in ema_metrics.items() if not isinstance(v, str)})
+            _barrier()
 
         # ---- Checkpointing + tracking (rank-0 only) ----
         if is_main:

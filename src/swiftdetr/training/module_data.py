@@ -226,11 +226,21 @@ class SwiftDetrData:
             prefetch_factor=self._prefetch_factor,
         )
 
-    def val_dataloader(self) -> DataLoader:
+    def val_dataloader(self, world_size: int = 1, rank: int = 0) -> DataLoader:
+        if world_size > 1:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(
+                self._dataset_val,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+            )
+        else:
+            sampler = torch.utils.data.SequentialSampler(self._dataset_val)
         return DataLoader(
             self._dataset_val,
             batch_size=self.train_config.batch_size,
-            sampler=torch.utils.data.SequentialSampler(self._dataset_val),
+            sampler=sampler,
             drop_last=False,
             collate_fn=self._collate_fn,
             num_workers=self._num_workers,
@@ -238,6 +248,17 @@ class SwiftDetrData:
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
         )
+
+    @property
+    def coco_gt(self):
+        """Return the pycocotools COCO GT object from the val (or train) dataset."""
+        for dataset in (self._dataset_val, self._dataset_train):
+            if dataset is None:
+                continue
+            coco = getattr(dataset, "coco", None)
+            if coco is not None:
+                return coco
+        return None
 
     @property
     def cat_id_to_name(self) -> dict:
