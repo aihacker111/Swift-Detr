@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--num-classes",
         type=int,
-        default=80,
+        default=90,
         help="Number of object classes (COCO: 80; background is added internally).",
     )
     p.add_argument("--epochs", type=int, default=100)
