@@ -66,6 +66,7 @@ _TC_NON_NAMESPACE_FIELDS = {
     "tensorboard",
     "wandb",
     "mlflow",
+    "clearml",
     "project",
     "run",
     "auto_batch_target_effective",

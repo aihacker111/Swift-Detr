@@ -245,6 +245,7 @@ class TrainConfig(BaseModel):
     tensorboard: bool = True
     wandb: bool = False
     mlflow: bool = False
+    clearml: bool = False
     project: Optional[str] = None
     run: Optional[str] = None
     class_names: Optional[List[str]] = None
