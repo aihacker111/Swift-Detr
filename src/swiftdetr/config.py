@@ -125,6 +125,11 @@ class ModelConfig(BaseConfig):
     fused_optimizer: bool = True
     backbone_lora: bool = False
     pretrain_weights: Optional[str] = None
+    # When True and ``pretrain_weights`` is set, Lightning training will load that
+    # checkpoint (and may download if the value is a hub/registry key). Default False
+    # avoids any pretrained detection init for scratch training. Ignored when loading
+    # for inference (``load_pretrain_weights(..., for_inference=True)``).
+    load_detection_pretrain: bool = False
     device: str = DEVICE
     model_name: Optional[str] = Field(
         default=None,

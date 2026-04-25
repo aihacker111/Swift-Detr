@@ -114,12 +114,18 @@ def load_pretrain_weights(
     nn_model: torch.nn.Module,
     model_config: ModelConfig,
     train_config: TrainConfig | None = None,
+    *,
+    for_inference: bool = False,
 ) -> List[str]:
     """Load pretrained checkpoint weights into *nn_model* in-place.
 
     Canonical implementation shared by the L1 facade (``_build_model_context``
-    in ``swiftdetr.detr``) and the L2 LightningModule (``SwiftDetrModule.__init__``
+    in ``swiftdetr.inference``) and the L2 LightningModule (``SwiftDetrModule.__init__``
     in ``swiftdetr.training.module_model``).
+
+    Training only runs this path when ``model_config.load_detection_pretrain`` is
+    ``True``; set ``for_inference=True`` to load a checkpoint for deployment
+    (``from_checkpoint``, etc.) regardless of that flag.
 
     Uses the Pydantic-aware logic from ``module_model.py``:
 
@@ -143,6 +149,8 @@ def load_pretrain_weights(
         train_config: Deprecated since v1.8 — no longer used internally.
             Passing a non-``None`` value emits a ``DeprecationWarning``.
             Omit the argument; it will be removed in v1.9.
+        for_inference: When ``True`` (inference / ``from_checkpoint``), load if
+            ``pretrain_weights`` is set, ignoring ``load_detection_pretrain``.
 
     Returns:
         List of class name strings from the checkpoint, or an empty list if none
@@ -154,6 +162,11 @@ def load_pretrain_weights(
     mc = model_config
     pretrain_weights = mc.pretrain_weights
     if pretrain_weights is None:
+        return []
+    if not for_inference and not mc.load_detection_pretrain:
+        logger.debug(
+            "Skipping pretrained detection weights: load_detection_pretrain is False."
+        )
         return []
     class_names: List[str] = []
 

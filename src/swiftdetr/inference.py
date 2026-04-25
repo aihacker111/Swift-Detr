@@ -76,7 +76,7 @@ def _build_model_context(model_config: "ModelConfig") -> ModelContext:
 
     class_names: List[str] = []
     if model_config.pretrain_weights is not None:
-        class_names = load_pretrain_weights(nn_model, model_config)
+        class_names = load_pretrain_weights(nn_model, model_config, for_inference=True)
         if hasattr(args, "num_classes") and getattr(args, "num_classes") != model_config.num_classes:
             args.num_classes = model_config.num_classes
 

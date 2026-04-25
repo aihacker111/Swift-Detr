@@ -46,7 +46,7 @@ class SwiftDetrModule(LightningModule):
 
         # Model, criterion, and postprocessor.
         self.model = build_model_from_config(model_config, train_config)
-        if model_config.pretrain_weights is not None:
+        if model_config.pretrain_weights is not None and model_config.load_detection_pretrain:
             # Capture the configured class count before loading weights so we can
             # detect any automatic alignment to the checkpoint.
             prev_num_classes = self.model_config.num_classes

@@ -185,6 +185,7 @@ def main() -> None:
         _mc["encoder_imagenet_weights"] = os.path.realpath(os.path.expanduser(args.encoder_imagenet_weights))
     if args.pretrain_weights:
         _mc["pretrain_weights"] = os.path.realpath(os.path.expanduser(args.pretrain_weights))
+        _mc["load_detection_pretrain"] = True
     if args.resolution is not None:
         if args.resolution <= 0 or args.resolution % 32 != 0:
             sys.exit(
