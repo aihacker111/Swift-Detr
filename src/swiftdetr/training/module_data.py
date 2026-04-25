@@ -167,7 +167,7 @@ class SwiftDetrData:
         self._kornia_normalize = build_normalize()
         logger.info("Kornia GPU augmentation pipeline built (backend=%s)", backend)
 
-    def train_dataloader(self, world_size: int = 1) -> DataLoader:
+    def train_dataloader(self, world_size: int = 1, rank: int = 0) -> DataLoader:
         dataset = self._dataset_train
         batch_size = self.train_config.batch_size
         effective_batch_size = batch_size * self.train_config.grad_accum_steps
@@ -193,6 +193,27 @@ class SwiftDetrData:
             )
 
         dataset = GradAccumAlignedDataset(dataset, effective_batch_size, world_size)
+
+        if world_size > 1:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True,
+            )
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                sampler=sampler,
+                collate_fn=self._collate_fn,
+                num_workers=self._num_workers,
+                pin_memory=self._pin_memory,
+                persistent_workers=self._persistent_workers,
+                prefetch_factor=self._prefetch_factor,
+            )
+
         return DataLoader(
             dataset,
             batch_size=batch_size,

@@ -4,7 +4,7 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-"""Pure PyTorch training orchestrator for Swift-DETR."""
+"""Pure PyTorch training orchestrator for Swift-DETR (single-GPU and multi-GPU DDP)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from swiftdetr.config import ModelConfig, TrainConfig
 from swiftdetr.datasets.coco import compute_multi_scale_scales
@@ -30,7 +32,65 @@ from swiftdetr.util.logger import get_logger
 logger = get_logger()
 
 
+# ---------------------------------------------------------------------------
+# DDP helpers
+# ---------------------------------------------------------------------------
+
+def _is_ddp() -> bool:
+    """Return True when running under torchrun (LOCAL_RANK env var set)."""
+    return "LOCAL_RANK" in os.environ
+
+
+def _local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", 0))
+
+
+def _world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def _rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def _is_main() -> bool:
+    return _rank() == 0
+
+
+def _setup_ddp() -> torch.device:
+    """Initialize NCCL process group and return the local CUDA device."""
+    local = _local_rank()
+    torch.cuda.set_device(local)
+    dist.init_process_group(backend="nccl")
+    device = torch.device(f"cuda:{local}")
+    logger.info(
+        "DDP initialised: rank=%d / world=%d | device=%s",
+        _rank(), _world_size(), device,
+    )
+    return device
+
+
+def _cleanup_ddp() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _barrier() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
 def _seed_everything(seed: int) -> None:
+    """Seed RNGs; per-rank offset ensures different data order on each GPU."""
+    seed = seed + _rank()
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -39,6 +99,7 @@ def _seed_everything(seed: int) -> None:
 
 
 def _resolve_device(train_config: TrainConfig) -> torch.device:
+    """Device for single-GPU / CPU runs (DDP resolves its own device via _setup_ddp)."""
     accelerator = str(train_config.accelerator).lower()
     if accelerator in {"auto", "gpu", "cuda"}:
         if torch.cuda.is_available():
@@ -48,43 +109,39 @@ def _resolve_device(train_config: TrainConfig) -> torch.device:
     return torch.device("cpu")
 
 
-class _CSVLogger:
-    """Minimal CSV metric logger."""
+# ---------------------------------------------------------------------------
+# CSV logger (rank-0 only)
+# ---------------------------------------------------------------------------
 
+class _CSVLogger:
     def __init__(self, path: str) -> None:
         self._path = path
-        self._writer: Optional[csv.DictWriter] = None
         self._file = None
+        self._writer: Optional[csv.DictWriter] = None
         self._fieldnames: list = []
 
     def log(self, row: dict) -> None:
         new_keys = [k for k in row if k not in self._fieldnames]
         if new_keys:
-            # Re-open and rewrite with updated headers if new keys appear
             self._fieldnames.extend(new_keys)
+            # Collect existing rows and rewrite with updated header
+            existing: list[dict] = []
             if self._file is not None:
                 self._file.close()
-            self._file = open(self._path, "a", newline="")
+                self._file = None
+            if os.path.exists(self._path) and os.path.getsize(self._path) > 0:
+                with open(self._path) as f:
+                    existing = list(csv.DictReader(f))
+            self._file = open(self._path, "w", newline="")
             self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames, extrasaction="ignore")
-            if os.path.getsize(self._path) == 0 or new_keys:
-                # Write header only once; if keys expanded, rewrite whole file
-                self._file.close()
-                # Collect existing rows
-                existing: list[dict] = []
-                if os.path.exists(self._path):
-                    with open(self._path) as f:
-                        reader = csv.DictReader(f)
-                        existing = list(reader)
-                self._file = open(self._path, "w", newline="")
-                self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames, extrasaction="ignore")
-                self._writer.writeheader()
-                for r in existing:
-                    self._writer.writerow(r)
+            self._writer.writeheader()
+            for r in existing:
+                self._writer.writerow(r)
 
         if self._file is None:
             self._file = open(self._path, "a", newline="")
             self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames, extrasaction="ignore")
-            if os.path.getsize(self._path) == 0:
+            if not os.path.exists(self._path) or os.path.getsize(self._path) == 0:
                 self._writer.writeheader()
 
         self._writer.writerow(row)
@@ -95,6 +152,10 @@ class _CSVLogger:
             self._file.close()
             self._file = None
 
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
 
 def _save_checkpoint(
     output_dir: Path,
@@ -130,10 +191,9 @@ def _load_resume_checkpoint(
     optimizer: Optional[torch.optim.Optimizer],
     scheduler,
 ) -> int:
-    """Load a checkpoint for resume; returns the starting epoch."""
+    """Load checkpoint for resume. Returns starting epoch."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
-    # Determine where model weights live
     if "model" in ckpt:
         state_dict = ckpt["model"]
     elif "state_dict" in ckpt:
@@ -142,8 +202,10 @@ def _load_resume_checkpoint(
     else:
         state_dict = ckpt
 
-    model_for_load = getattr(model, "_orig_mod", model)
-    model_for_load.load_state_dict(state_dict, strict=False)
+    # Unwrap DDP / compile before loading
+    raw_model = getattr(model, "module", model)
+    raw_model = getattr(raw_model, "_orig_mod", raw_model)
+    raw_model.load_state_dict(state_dict, strict=False)
 
     start_epoch = int(ckpt.get("epoch", 0)) + 1
 
@@ -163,6 +225,10 @@ def _load_resume_checkpoint(
     return start_epoch
 
 
+# ---------------------------------------------------------------------------
+# Main fit function
+# ---------------------------------------------------------------------------
+
 def fit(
     wrapper: SwiftDetrWrapper,
     data: SwiftDetrData,
@@ -170,90 +236,122 @@ def fit(
     resume: Optional[str] = None,
     fast_dev_run: Optional[int] = None,
 ) -> None:
-    """Full training loop — pure PyTorch, no Lightning.
+    """Full training loop — pure PyTorch, single-GPU or multi-GPU DDP.
+
+    Single GPU::
+
+        python train.py --dataset /data/coco --output ./out
+
+    Multi-GPU (launch with torchrun)::
+
+        torchrun --nproc_per_node=4 train.py --dataset /data/coco --output ./out
 
     Args:
         wrapper: Model wrapper (model, criterion, postprocess).
-        data: Data module (datasets + dataloaders + kornia pipeline).
-        output_dir: Where checkpoints and logs are written.
-        resume: Optional path to a checkpoint to resume from.
-        fast_dev_run: If set, run only this many batches per epoch (sanity check).
+        data: Data builder (datasets + dataloaders + kornia pipeline).
+        output_dir: Directory for checkpoints and logs.
+        resume: Optional checkpoint path to resume from.
+        fast_dev_run: If set, run only this many batches (sanity check).
     """
     tc = wrapper.train_config
     mc = wrapper.model_config
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
 
-    # Seed
+    # ---- DDP or single-GPU device resolution ----
+    ddp_active = _is_ddp()
+    if ddp_active:
+        device = _setup_ddp()
+    else:
+        device = _resolve_device(tc)
+
+    world_size = _world_size()
+    is_main = _is_main()
+
+    if is_main:
+        output_path.mkdir(parents=True, exist_ok=True)
+
+    # ---- Seeding ----
     if tc.seed is not None:
         _seed_everything(tc.seed)
 
-    # Device + precision
-    device = _resolve_device(tc)
+    # ---- Precision + cuDNN ----
     precision = resolve_precision(mc)
     scaler: Optional[torch.amp.GradScaler] = None
     if precision == "fp16":
         scaler = torch.amp.GradScaler(device=device.type)
-    logger.info("Device: %s | Precision: %s", device, precision)
-
-    # cuDNN
     torch.backends.cudnn.benchmark = False
+    if is_main:
+        logger.info("Device: %s | Precision: %s | World size: %d", device, precision, world_size)
 
-    # Move model to device
+    # ---- Model → device ----
     wrapper.to(device)
     model = wrapper.model
     criterion = wrapper.criterion
     postprocess = wrapper.postprocess
 
-    # DataLoaders
-    train_loader = data.train_dataloader(world_size=1)
+    # ---- Sync BatchNorm (optional, good for small batch sizes in DDP) ----
+    if ddp_active and tc.sync_bn:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+    # ---- Wrap with DDP ----
+    if ddp_active:
+        find_unused = mc.segmentation_head  # seg head may leave params unused
+        model = DDP(model, device_ids=[_local_rank()], find_unused_parameters=find_unused)
+
+    # ---- DataLoaders ----
+    train_loader = data.train_dataloader(world_size=world_size, rank=_rank())
     val_loader = data.val_dataloader()
+
     steps_per_epoch = max(1, len(train_loader))
     total_steps = steps_per_epoch * tc.epochs
 
-    # Optimizer + scheduler
+    # ---- Optimizer + scheduler ----
+    # Build against the unwrapped model so param names match get_param_dict expectations
+    wrapper.model = getattr(model, "module", model)
     optimizer, scheduler = wrapper.build_optimizer_and_scheduler(total_steps, steps_per_epoch)
+    wrapper.model = model  # restore reference
 
-    # Resume
+    # ---- Resume ----
     start_epoch = 0
     if resume:
         start_epoch = _load_resume_checkpoint(resume, model, optimizer, scheduler)
+    _barrier()  # all ranks wait until rank-0 finishes loading
 
-    # EMA
+    # ---- EMA (main process only to avoid duplicate copies) ----
     ema_manager: Optional[EMAManager] = None
-    if tc.use_ema:
-        raw_model = getattr(model, "_orig_mod", model)
+    if tc.use_ema and is_main:
+        raw_model = getattr(model, "module", model)
+        raw_model = getattr(raw_model, "_orig_mod", raw_model)
         ema_manager = EMAManager(raw_model, decay=tc.ema_decay, tau=tc.ema_tau, device=device)
 
-    # Drop-path scheduler
+    # ---- Drop-path scheduler ----
     dp_scheduler: Optional[DropPathScheduler] = None
     if tc.drop_path > 0.0:
         dp_scheduler = DropPathScheduler(drop_path=tc.drop_path)
         dp_scheduler.build(tc.epochs, steps_per_epoch)
 
-    # Multi-scale
-    scales = []
+    # ---- Multi-scale ----
+    scales: list = []
     if tc.multi_scale:
         scales = compute_multi_scale_scales(mc.resolution, tc.expanded_scales, mc.patch_size, mc.num_windows)
 
-    # Trackers
-    best_tracker = BestModelTracker(output_dir, use_ema=tc.use_ema)
-    early_stopper: Optional[EarlyStoppingTracker] = (
-        EarlyStoppingTracker(
-            patience=tc.early_stopping_patience,
-            min_delta=tc.early_stopping_min_delta,
-            use_ema=tc.early_stopping_use_ema,
-        )
-        if tc.early_stopping
-        else None
-    )
+    # ---- Trackers + loggers (rank-0 only) ----
+    best_tracker: Optional[BestModelTracker] = None
+    early_stopper: Optional[EarlyStoppingTracker] = None
+    csv_logger: Optional[_CSVLogger] = None
+    if is_main:
+        best_tracker = BestModelTracker(output_dir, use_ema=tc.use_ema)
+        if tc.early_stopping:
+            early_stopper = EarlyStoppingTracker(
+                patience=tc.early_stopping_patience,
+                min_delta=tc.early_stopping_min_delta,
+                use_ema=tc.early_stopping_use_ema,
+            )
+        csv_logger = _CSVLogger(str(output_path / "metrics.csv"))
 
-    # Logging
-    csv_logger = _CSVLogger(str(output_path / "metrics.csv"))
     cat_id_to_name = data.cat_id_to_name
     class_names = data.class_names
 
-    # Resolve args_dict for checkpoint payloads
     train_config_dump = tc.model_dump() if hasattr(tc, "model_dump") else {}
     if class_names and not train_config_dump.get("class_names"):
         train_config_dump = {**train_config_dump, "class_names": class_names}
@@ -265,13 +363,21 @@ def fit(
 
     global_step = start_epoch * steps_per_epoch
 
-    logger.info(
-        "Starting training: epochs=%d start=%d steps/epoch=%d",
-        tc.epochs, start_epoch, steps_per_epoch,
-    )
+    if is_main:
+        logger.info(
+            "Starting training: epochs=%d start=%d steps/epoch=%d world=%d",
+            tc.epochs, start_epoch, steps_per_epoch, world_size,
+        )
+
+    should_stop = False
 
     for epoch in range(start_epoch, tc.epochs):
-        logger.info("Epoch %d/%d", epoch + 1, tc.epochs)
+        # Set epoch on DistributedSampler so each rank shuffles differently
+        if ddp_active and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
+
+        if is_main:
+            logger.info("Epoch %d/%d", epoch + 1, tc.epochs)
 
         dp_schedule = dp_scheduler.dp_schedule if dp_scheduler is not None else None
 
@@ -299,14 +405,15 @@ def fit(
         )
         global_step += steps_per_epoch
 
-        logger.info(
-            "  train | loss=%.4f lr=%.6f",
-            train_metrics["loss"], train_metrics["lr"],
-        )
+        if is_main:
+            logger.info(
+                "  train | loss=%.4f lr=%.6f",
+                train_metrics["loss"], train_metrics["lr"],
+            )
 
         row: dict = {"epoch": epoch, **{f"train/{k}": v for k, v in train_metrics.items()}}
 
-        # Validation
+        # ---- Validation (rank-0 only to avoid duplicate metric computation) ----
         run_eval = (
             fast_dev_run is not None
             or (epoch + 1) % tc.eval_interval == 0
@@ -315,9 +422,11 @@ def fit(
         val_metrics: dict = {}
         ema_metrics: dict = {}
 
-        if run_eval:
+        if run_eval and is_main:
+            # Unwrap DDP for evaluation (model already in eval-compatible state)
+            eval_model = getattr(model, "module", model)
             val_metrics = evaluate(
-                model=model,
+                model=eval_model,
                 postprocess=postprocess,
                 loader=val_loader,
                 device=device,
@@ -352,45 +461,65 @@ def fit(
                 print_metrics_table("val (EMA)", ema_metrics)
                 row.update({f"val/ema_{k}": v for k, v in ema_metrics.items()})
 
-        csv_logger.log(row)
+        # ---- Checkpointing + tracking (rank-0 only) ----
+        if is_main:
+            if csv_logger:
+                csv_logger.log(row)
 
-        # Checkpointing
-        model_sd = wrapper.state_dict()
-        ema_sd = ema_manager.state_dict() if ema_manager is not None else None
+            # Unwrap for state dict (DDP wraps under .module)
+            unwrapped = getattr(model, "module", model)
+            unwrapped = getattr(unwrapped, "_orig_mod", unwrapped)
+            model_sd = unwrapped.state_dict()
+            ema_sd = ema_manager.state_dict() if ema_manager is not None else None
 
-        _save_checkpoint(
-            output_path, "last.pth",
-            model_sd, optimizer, scheduler,
-            epoch, global_step, ema_sd,
-            train_config_dump, model_name,
-        )
-        if (epoch + 1) % tc.checkpoint_interval == 0:
             _save_checkpoint(
-                output_path, f"checkpoint_{epoch}.pth",
+                output_path, "last.pth",
                 model_sd, optimizer, scheduler,
                 epoch, global_step, ema_sd,
                 train_config_dump, model_name,
             )
+            if (epoch + 1) % tc.checkpoint_interval == 0:
+                _save_checkpoint(
+                    output_path, f"checkpoint_{epoch}.pth",
+                    model_sd, optimizer, scheduler,
+                    epoch, global_step, ema_sd,
+                    train_config_dump, model_name,
+                )
 
-        if run_eval and val_metrics:
-            combined_metrics = {**val_metrics}
-            if ema_metrics:
-                combined_metrics["ema_mAP_50_95"] = ema_metrics.get("mAP_50_95", 0.0)
-            best_tracker.update(
-                combined_metrics, model_sd, train_config_dump,
-                epoch, global_step, ema_sd, model_name,
-            )
+            if run_eval and val_metrics and best_tracker:
+                combined = {**val_metrics}
+                if ema_metrics:
+                    combined["ema_mAP_50_95"] = ema_metrics.get("mAP_50_95", 0.0)
+                best_tracker.update(
+                    combined, model_sd, train_config_dump,
+                    epoch, global_step, ema_sd, model_name,
+                )
 
-            if early_stopper is not None:
-                early_stopper.update(combined_metrics)
-                if early_stopper.should_stop:
-                    logger.info("Early stopping at epoch %d.", epoch + 1)
-                    break
+                if early_stopper is not None:
+                    early_stopper.update(combined)
+                    if early_stopper.should_stop:
+                        logger.info("Early stopping at epoch %d.", epoch + 1)
+                        should_stop = True
 
-        if fast_dev_run is not None:
-            logger.info("fast_dev_run=%d: stopping after 1 epoch.", fast_dev_run)
+        # Broadcast early-stop decision to all ranks
+        if ddp_active:
+            stop_tensor = torch.tensor(int(should_stop), device=device)
+            dist.broadcast(stop_tensor, src=0)
+            should_stop = bool(stop_tensor.item())
+
+        if should_stop:
             break
 
-    best_tracker.finalize()
-    csv_logger.close()
-    logger.info("Training complete. Outputs at: %s", output_dir)
+        if fast_dev_run is not None:
+            if is_main:
+                logger.info("fast_dev_run=%d: stopping after 1 epoch.", fast_dev_run)
+            break
+
+    if is_main and best_tracker:
+        best_tracker.finalize()
+    if is_main and csv_logger:
+        csv_logger.close()
+    if is_main:
+        logger.info("Training complete. Outputs at: %s", output_dir)
+
+    _cleanup_ddp()
