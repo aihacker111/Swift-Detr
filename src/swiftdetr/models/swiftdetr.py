@@ -298,6 +298,9 @@ def build_model(args: "BuilderArgs") -> SwiftDetrModel:
         freeze_encoder=args.freeze_encoder,
         gradient_checkpointing=args.gradient_checkpointing,
         positional_encoding_size=args.positional_encoding_size,
+        projector_num_blocks=getattr(args, "projector_num_blocks", 3),
+        projector_expand_ratio=getattr(args, "projector_expand_ratio", 8 / 3),
+        projector_layer_scale_init=getattr(args, "projector_layer_scale_init", 1e-6),
     )
 
     if args.encoder_only:

@@ -2,7 +2,7 @@
 
 Extracts multi-scale spatial feature maps from SwiftNet stages 1-3
 (strides 8, 16, 32 → P3, P4, P5) and projects them to a uniform
-hidden dimension via lateral 1×1 convolutions + LayerNorm.
+hidden dimension via cross-scale ConvNeXt fusion (SwiftNetConvNextProjector).
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from swiftdetr.models.backbone.base import BackboneBase
+from swiftdetr.models.backbone.convnext_projector import SwiftNetConvNextProjector
 from swiftdetr.models.backbone.swiftnet.swift_net import SWIFTNet, swift_net_tiny, swift_net_small, swift_net_base
 from swiftdetr.util.tensors import NestedTensor
 
@@ -38,20 +39,6 @@ def _build_swiftnet(variant: str, drop_path_rate: float) -> SWIFTNet:
     return factory(pretrained=False, drop_path_rate=drop_path_rate)
 
 
-class _ChannelLastLayerNorm(nn.Module):
-    """LayerNorm applied in BCHW format (normalises over the channel dim)."""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: [B, C, H, W]
-        x = x.permute(0, 2, 3, 1)   # → [B, H, W, C]
-        x = self.norm(x)
-        return x.permute(0, 3, 1, 2)  # → [B, C, H, W]
-
-
 class SwiftNetBackbone(BackboneBase):
     """SwiftNet backbone that produces P3/P4/P5 feature pyramids for Swift-DETR.
 
@@ -61,12 +48,19 @@ class SwiftNetBackbone(BackboneBase):
         Stage 2  stride 16  →  P4
         Stage 3  stride 32  →  P5
 
+    Features from all active stages are cross-fused via SwiftNetConvNextProjector:
+    each output FPN level receives resampled contributions from every input stage,
+    improving multi-scale context relative to independent lateral projections.
+
     Args:
         variant: One of ``"swiftnet_tiny"``, ``"swiftnet_small"``, ``"swiftnet_base"``.
         out_channels: Output channel dim (DETR hidden dim).
         drop_path_rate: Stochastic-depth rate for SwiftNet blocks.
         freeze_encoder: Freeze all backbone parameters when ``True``.
         projector_scale: Ordered list of FPN levels to produce (e.g. ``["P3","P4","P5"]``).
+        projector_num_blocks: ConvNeXtBlock count per fusion level (default 3).
+        projector_expand_ratio: SwiGLU expand ratio (default 8/3).
+        projector_layer_scale_init: LayerScale init value; 0 disables it (default 1e-6).
     """
 
     def __init__(
@@ -76,6 +70,9 @@ class SwiftNetBackbone(BackboneBase):
         drop_path_rate: float = 0.0,
         freeze_encoder: bool = False,
         projector_scale: list[str] | None = None,
+        projector_num_blocks: int = 3,
+        projector_expand_ratio: float = 8 / 3,
+        projector_layer_scale_init: float = 1e-6,
     ) -> None:
         super().__init__()
 
@@ -98,16 +95,16 @@ class SwiftNetBackbone(BackboneBase):
 
         self.stage_indices: list[int] = [_SCALE_TO_STAGE[s] for s in self.projector_scale]
 
-        # Lateral projections: SwiftNet stage channels → out_channels
+        # Cross-scale ConvNeXt projector: all stages → each FPN level
         backbone_dims = self.encoder.config.dims  # [C0, C1, C2, C3]
-        self.lateral_convs = nn.ModuleList([
-            nn.Conv2d(backbone_dims[i], out_channels, kernel_size=1, bias=False)
-            for i in self.stage_indices
-        ])
-        self.lateral_norms = nn.ModuleList([
-            _ChannelLastLayerNorm(out_channels)
-            for _ in self.stage_indices
-        ])
+        in_channels = [backbone_dims[i] for i in self.stage_indices]
+        self.projector = SwiftNetConvNextProjector(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_blocks=projector_num_blocks,
+            expand_ratio=projector_expand_ratio,
+            layer_scale_init=projector_layer_scale_init,
+        )
 
         self._export = False
 
@@ -115,9 +112,6 @@ class SwiftNetBackbone(BackboneBase):
         """Reshape [B, H*W, C] token tensor to [B, C, H, W] spatial map."""
         B, _N, C = tokens.shape
         return tokens.reshape(B, h, w, C).permute(0, 3, 1, 2).contiguous()
-
-    def _project(self, feat_2d: Tensor, lateral: nn.Conv2d, norm: _ChannelLastLayerNorm) -> Tensor:
-        return norm(lateral(feat_2d))
 
     def forward(self, tensor_list: NestedTensor) -> list[NestedTensor]:
         x = tensor_list.tensors
@@ -134,13 +128,19 @@ class SwiftNetBackbone(BackboneBase):
             (H // 32, W // 32),   # stage 3 – stride 32 → P5
         ]
 
+        # Convert token sequences to 2D spatial maps for each selected stage
+        feats_2d = [
+            self._tokens_to_2d(all_features[i], *stage_hw[i])
+            for i in self.stage_indices
+        ]
+
+        # Cross-scale ConvNeXt fusion → [P3, P4, P5]
+        proj_feats = self.projector(feats_2d)
+
         m = tensor_list.mask
         out: list[NestedTensor] = []
-
-        for stage_i, lateral, norm in zip(self.stage_indices, self.lateral_convs, self.lateral_norms):
+        for feat_proj, stage_i in zip(proj_feats, self.stage_indices):
             h, w = stage_hw[stage_i]
-            feat_2d = self._tokens_to_2d(all_features[stage_i], h, w)
-            feat_proj = self._project(feat_2d, lateral, norm)
             mask = F.interpolate(m[None].float(), size=(h, w)).to(torch.bool)[0]
             out.append(NestedTensor(feat_proj, mask))
 
@@ -160,12 +160,15 @@ class SwiftNetBackbone(BackboneBase):
             (H // 16, W // 16),
             (H // 32, W // 32),
         ]
+        feats_2d = [
+            self._tokens_to_2d(all_features[i], *stage_hw[i])
+            for i in self.stage_indices
+        ]
+        proj_feats = self.projector(feats_2d)
         out_feats: list[Tensor] = []
         out_masks: list[Tensor] = []
-        for stage_i, lateral, norm in zip(self.stage_indices, self.lateral_convs, self.lateral_norms):
+        for feat_proj, stage_i in zip(proj_feats, self.stage_indices):
             h, w = stage_hw[stage_i]
-            feat_2d = self._tokens_to_2d(all_features[stage_i], h, w)
-            feat_proj = self._project(feat_2d, lateral, norm)
             out_feats.append(feat_proj)
             out_masks.append(torch.zeros((B, h, w), dtype=torch.bool, device=feat_proj.device))
         return out_feats, out_masks

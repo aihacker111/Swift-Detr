@@ -76,6 +76,9 @@ def build_backbone(
     freeze_encoder: bool,
     gradient_checkpointing: bool,
     positional_encoding_size: int,
+    projector_num_blocks: int = 3,
+    projector_expand_ratio: float = 8 / 3,
+    projector_layer_scale_init: float = 1e-6,
 ) -> Joiner:
     """Build a Joiner combining SwiftNetBackbone with sinusoidal position encoding.
 
@@ -89,6 +92,9 @@ def build_backbone(
         freeze_encoder: Freeze SwiftNet weights when ``True``.
         gradient_checkpointing: Reserved for future gradient-checkpointing support.
         positional_encoding_size: Grid side length for the sinusoidal PE.
+        projector_num_blocks: ConvNeXtBlock count per fusion level.
+        projector_expand_ratio: SwiGLU expand ratio in ConvNeXtBlock.
+        projector_layer_scale_init: LayerScale init value; 0 disables it.
 
     Returns:
         ``Joiner(SwiftNetBackbone, PositionEmbedding)``.
@@ -100,5 +106,8 @@ def build_backbone(
         drop_path_rate=drop_path,
         freeze_encoder=freeze_encoder,
         projector_scale=projector_scale,
+        projector_num_blocks=projector_num_blocks,
+        projector_expand_ratio=projector_expand_ratio,
+        projector_layer_scale_init=projector_layer_scale_init,
     )
     return Joiner(backbone, pe)

@@ -80,6 +80,10 @@ class ModelConfig(BaseConfig):
 
     # ── Feature pyramid ───────────────────────────────────────────────────────
     projector_scale: List[Literal["P3", "P4", "P5"]] = ["P3", "P4", "P5"]
+    # ConvNeXt cross-scale projector settings
+    projector_num_blocks: int = Field(default=3, ge=1)
+    projector_expand_ratio: float = Field(default=8 / 3, gt=0.0)
+    projector_layer_scale_init: float = Field(default=1e-6, ge=0.0)
 
     # ── Transformer ───────────────────────────────────────────────────────────
     hidden_dim: int = 256
