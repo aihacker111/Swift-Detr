@@ -109,7 +109,7 @@ def load_swiftnet_imagenet_weights(
     checkpoint_path: str,
     *,
     map_location: str | torch.device = "cpu",
-    strict: bool = False,
+    strict: bool = True,
 ) -> _IncompatibleKeys:
     """Load ImageNet (or other trunk-only) weights into a :class:`SWIFTNet` module.
 
