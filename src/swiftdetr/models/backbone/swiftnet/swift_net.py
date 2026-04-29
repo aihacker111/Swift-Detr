@@ -289,9 +289,9 @@ def swift_net_base(pretrained: bool = False, **kwargs) -> SWIFTNet:
     return _build_variant(
         dict(
             dims=[64, 128, 256, 512],
-            depths=[2, 2, 8, 2],
+            depths=[2, 2, 8, 3],
             num_heads=[2, 4, 8, 16],
-            drop_path_rate=0.2,
+            drop_path_rate=0.25,
         ),
         pretrained,
         kwargs,
