@@ -26,7 +26,7 @@ BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 MODEL_SIZE="${MODEL_SIZE:-base}"
 PRETRAINED_ENCODER="${PRETRAINED_ENCODER:-/workspace/Swift-Detr/checkpoints/swift_net_base/2026_04_26_15_28_59/checkpoint_best.pth}"
-RESUME="${RESUME:-}"
+RESUME="${RESUME:-/workspace/Swift-Detr/output/swiftdetr_base_supervised/checkpoint.pth}"
 
 echo "Checking GPUs..."
 if command -v nvidia-smi >/dev/null 2>&1; then
