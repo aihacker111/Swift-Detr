@@ -73,7 +73,7 @@ else
     --dataset-dir "${DATASET_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --batch-size "${BATCH_SIZE_PER_GPU}" \
-    --num-workers 16 \
+    --num-workers 8 \
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --use-varifocal-loss \
