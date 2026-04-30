@@ -129,17 +129,6 @@ class TrainConfig(BaseModel):
     giou_loss_coef: float = 2.0
     use_varifocal_loss: bool = True  # Varifocal loss thay Focal loss cho classification
     use_convnext_projector: bool = True
-    # Prototype Alignment (lwdetr_prototype) — EMA class prototypes cho query feature alignment
-    use_prototype_align: bool = True
-    prototype_loss_coef: float = 0.1
-    prototype_momentum: float = 0.999      # EMA decay cho prototype update
-    prototype_warmup_steps: int = 200      # Chỉ update prototype, chưa tính loss
-    prototype_temperature: float = 0.1     # τ trong cosine classifier
-    # Enhanced PrototypeMemory (lwdetr_prototype)
-    prototype_repulsion_coef: float = 0.1  # [ENH-3] Inter-class repulsion loss weight
-    prototype_use_freq_weight: bool = True # [ENH-2] Class-frequency weighting
-    prototype_use_quality_weight: bool = True  # [ENH-4] Prototype quality weighting
-    prototype_use_repulsion: bool = True   # [ENH-3] Toggle inter-class repulsion
     dataset_file: Literal["coco", "o365", "roboflow"] = "roboflow"
     square_resize_div_64: bool = True
     dataset_dir: str  # COCO layout root (train/, val/, annotations/); also default for coco_path when unset

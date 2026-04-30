@@ -889,10 +889,6 @@
 #         )
 #         metric_logger.update(class_error=loss_dict_reduced["class_error"])
 
-#         # lwdetr_query: log prototype alignment loss
-#         if "loss_proto_align" in loss_dict_reduced:
-#             metric_logger.update(loss_proto_align=loss_dict_reduced["loss_proto_align"].item())
-
 #         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
  
 #     metric_logger.synchronize_between_processes()
@@ -2129,10 +2125,6 @@ def train_one_epoch(
             **loss_dict_reduced_unscaled,
         )
         metric_logger.update(class_error=loss_dict_reduced["class_error"])
-
-        # lwdetr_query: log prototype alignment loss
-        if "loss_proto_align" in loss_dict_reduced:
-            metric_logger.update(loss_proto_align=loss_dict_reduced["loss_proto_align"].item())
 
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
  

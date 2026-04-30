@@ -90,10 +90,7 @@ def populate_args(**extra_kwargs):
         # use_rsa: mặc định False (khớp ModelConfig). Đếm param *có* SRA → chạy: --use-rsa
         use_windowed_attn=False, use_rsa=False, sra_shared=True, sra_G=64, sra_heads=16,
         use_convnext_projector=True,
-        use_prototype_align=True, prototype_loss_coef=0.1, prototype_momentum=0.999,
-        prototype_warmup_steps=200, prototype_temperature=0.1, prototype_repulsion_coef=0.1,
-        prototype_use_freq_weight=True, prototype_use_quality_weight=True,
-        prototype_use_repulsion=True, subcommand=None,
+        subcommand=None,
         segmentation_head=False, mask_downsample_ratio=4,
         mask_ce_loss_coef=1.0, mask_dice_loss_coef=1.0,
     )

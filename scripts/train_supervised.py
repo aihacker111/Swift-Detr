@@ -56,7 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--batch-size", type=int, default=4, help="Per-GPU batch size")
     run.add_argument("--num-workers", type=int, default=8, help="DataLoader workers per process")
     run.add_argument("--epochs", type=int, default=50)
-    run.add_argument("--grad-accum-steps", type=int, default=4)
+    run.add_argument("--grad-accum-steps", type=int, default=8)
     run.add_argument("--run-test", action="store_true", help="Run validation after training")
     run.add_argument("--tensorboard", action="store_true", default=True)
     run.add_argument("--no-tensorboard", action="store_false", dest="tensorboard")
@@ -115,23 +115,6 @@ def _build_parser() -> argparse.ArgumentParser:
     loss.add_argument("--bbox-loss-coef", type=float, default=5.0)
     loss.add_argument("--giou-loss-coef", type=float, default=2.0)
 
-    proto = p.add_argument_group("prototype alignment (optional)")
-    proto.add_argument("--no-prototype-align", action="store_false", dest="use_prototype_align")
-    proto.add_argument("--prototype-loss-coef", type=float, default=0.1)
-    proto.add_argument("--prototype-momentum", type=float, default=0.999)
-    proto.add_argument("--prototype-warmup-steps", type=int, default=200)
-    proto.add_argument("--prototype-temperature", type=float, default=0.1)
-    proto.add_argument("--prototype-repulsion-coef", type=float, default=0.1)
-    proto.add_argument("--no-prototype-use-freq-weight", action="store_false", dest="prototype_use_freq_weight")
-    proto.add_argument("--no-prototype-use-quality-weight", action="store_false", dest="prototype_use_quality_weight")
-    proto.add_argument("--no-prototype-use-repulsion", action="store_false", dest="prototype_use_repulsion")
-
-    p.set_defaults(
-        use_prototype_align=True,
-        prototype_use_freq_weight=True,
-        prototype_use_quality_weight=True,
-        prototype_use_repulsion=True,
-    )
     return p
 
 
@@ -184,15 +167,6 @@ def main() -> None:
         bbox_loss_coef=args.bbox_loss_coef,
         giou_loss_coef=args.giou_loss_coef,
         use_convnext_projector=use_convnext,
-        use_prototype_align=args.use_prototype_align,
-        prototype_loss_coef=args.prototype_loss_coef,
-        prototype_momentum=args.prototype_momentum,
-        prototype_warmup_steps=args.prototype_warmup_steps,
-        prototype_temperature=args.prototype_temperature,
-        prototype_repulsion_coef=args.prototype_repulsion_coef,
-        prototype_use_freq_weight=args.prototype_use_freq_weight,
-        prototype_use_quality_weight=args.prototype_use_quality_weight,
-        prototype_use_repulsion=args.prototype_use_repulsion,
         freeze_encoder=args.freeze_encoder,
     )
 

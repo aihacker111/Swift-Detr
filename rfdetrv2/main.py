@@ -855,17 +855,6 @@ def get_args_parser():
 
     parser.add_argument('--no_convnext_projector',        action='store_true', dest='no_use_convnext_projector')
 
-    # Prototype Alignment (lwdetr_query)
-    parser.add_argument('--no_prototype_align',            action='store_false', dest='use_prototype_align')
-    parser.add_argument('--prototype_loss_coef',          default=0.1, type=float)
-    parser.add_argument('--prototype_momentum',            default=0.999, type=float)
-    parser.add_argument('--prototype_warmup_steps',       default=200, type=int)
-    parser.add_argument('--prototype_temperature',        default=0.1, type=float)
-    parser.add_argument('--prototype_repulsion_coef',     default=0.1, type=float)
-    parser.add_argument('--no_prototype_use_freq_weight', action='store_false', dest='prototype_use_freq_weight')
-    parser.add_argument('--no_prototype_use_quality_weight', action='store_false', dest='prototype_use_quality_weight')
-    parser.add_argument('--no_prototype_use_repulsion',    action='store_false', dest='prototype_use_repulsion')
-
     # Dataset
     parser.add_argument('--dataset_file',        default="coco")
     parser.add_argument('--coco_path',           type=str)
@@ -1063,16 +1052,6 @@ def populate_args(
     gradient_checkpointing=False,
     use_windowed_attn=False,
     use_convnext_projector=True,
-    # Prototype Alignment (lwdetr_prototype)
-    use_prototype_align=True,
-    prototype_loss_coef=0.1,
-    prototype_momentum=0.999,
-    prototype_warmup_steps=200,
-    prototype_temperature=0.1,
-    prototype_repulsion_coef=0.1,
-    prototype_use_freq_weight=True,
-    prototype_use_quality_weight=True,
-    prototype_use_repulsion=True,
     # Additional
     subcommand=None,
     **extra_kwargs,
@@ -1184,15 +1163,6 @@ def populate_args(
         gradient_checkpointing=gradient_checkpointing,
         use_windowed_attn=use_windowed_attn,
         use_convnext_projector=use_convnext_projector,
-        use_prototype_align=use_prototype_align,
-        prototype_loss_coef=prototype_loss_coef,
-        prototype_momentum=prototype_momentum,
-        prototype_warmup_steps=prototype_warmup_steps,
-        prototype_temperature=prototype_temperature,
-        prototype_repulsion_coef=prototype_repulsion_coef,
-        prototype_use_freq_weight=prototype_use_freq_weight,
-        prototype_use_quality_weight=prototype_use_quality_weight,
-        prototype_use_repulsion=prototype_use_repulsion,
         subcommand=subcommand,
         **extra_kwargs,
     )

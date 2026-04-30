@@ -6,32 +6,6 @@
 
 """
 LW-DETR model and criterion classes.
-
-Thay đổi so với bản trước
---------------------------
-[REPLACE] loss_query_contrastive (InfoNCE) → loss_prototype_align
-
-Vấn đề của InfoNCE:
-  - Cần ≥2 instances cùng class trong batch → rare class = zero gradient
-  - Early training: queries chưa matched ổn → signal nhiễu
-  - Late training: loss collapse về 0 khi features đã similar → không học thêm
-  - Phụ thuộc batch composition → không stable giữa các bước
-
-Giải pháp — PrototypeMemory + loss_prototype_align:
-  - Duy trì C class prototypes như EMA buffer (không phải parameter)
-  - Mỗi batch: update prototype của các class xuất hiện trong GT
-  - Loss: cosine similarity giữa query features và GT class prototype
-  - Guarantee: luôn có signal miễn là batch có GT box
-  - Curriculum tự nhiên: prototype chính xác hơn theo thời gian
-  - Compatible với dist training: all_gather features trước khi update
-
-PrototypeMemory:
-  - register_buffer: persist qua steps, không train gradient
-  - EMA momentum = 0.999 (mặc định) — prototype thay đổi chậm, stable
-  - Distributed: gather features từ tất cả GPUs trước khi update
-  - Warmup: 200 steps đầu chỉ update prototype, chưa tính loss
-    (tránh loss sai khi prototype chưa có ý nghĩa)
-  - Temperature scaling: τ=0.1 → hard negatives, học biên class rõ hơn
 """
 
 import copy
@@ -39,7 +13,6 @@ import math
 from typing import Callable
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -61,328 +34,6 @@ from rfdetrv2.util.misc import (
     nested_tensor_from_tensor_list,
 )
 
-
-# ---------------------------------------------------------------------------
-# PrototypeMemory
-# ---------------------------------------------------------------------------
-
-class PrototypeMemory(nn.Module):
-    """EMA class prototype memory cho query feature alignment.
- 
-    Cải tiến so với v1:
-    [ENH-1] Adaptive momentum: 0.99 → momentum theo training progress
-            Early training: update nhanh hơn (prototype chưa ổn định)
-            Late training:  update chậm hơn (giữ stability)
- 
-    [ENH-2] Class-frequency weighted loss
-            Rare class xuất hiện ít → prototype update ít → weight loss cao hơn
-            Giải quyết vòng lặp bất lợi của rare class
- 
-    [ENH-3] Dual loss: pull + push
-            Pull: cross-entropy kéo feature về đúng prototype (giống v1)
-            Push: inter-class repulsion đẩy prototypes ra xa nhau
-                  → feature space orthogonal hơn → class boundary rõ hơn
- 
-    [ENH-4] Prototype quality score
-            Track variance của EMA updates → prototype ổn định → weight loss cao
-            Prototype dao động nhiều → weight loss thấp → ít tin tưởng hơn
- 
-    Args:
-        num_classes:     số class (không tính background)
-        feat_dim:        dimension của query feature (= hidden_dim)
-        momentum:        EMA decay target. Adaptive từ 0.99 → momentum.
-        warmup_steps:    số bước đầu chỉ update prototype, chưa tính loss.
-        temperature:     τ trong cosine classifier. 0.1 → hard negatives.
-        repulsion_coef:  weight của inter-class repulsion loss [ENH-3].
-                         0.1 là starting point, tăng nếu feature space vẫn overlap.
-        use_freq_weight: bật/tắt class-frequency weighting [ENH-2].
-        use_quality_weight: bật/tắt prototype quality weighting [ENH-4].
-        use_repulsion:   bật/tắt inter-class repulsion [ENH-3].
-    """
- 
-    def __init__(
-        self,
-        num_classes:        int,
-        feat_dim:           int,
-        momentum:           float = 0.999,
-        warmup_steps:       int   = 200,
-        temperature:        float = 0.1,
-        repulsion_coef:     float = 0.1,
-        use_freq_weight:    bool  = True,
-        use_quality_weight: bool  = True,
-        use_repulsion:      bool  = True,
-    ):
-        super().__init__()
- 
-        # Core buffers — v1
-        self.register_buffer("prototypes",        torch.zeros(num_classes, feat_dim))
-        self.register_buffer("proto_initialized", torch.zeros(num_classes, dtype=torch.bool))
-        self.register_buffer("step",              torch.tensor(0, dtype=torch.long))
- 
-        # [ENH-2] Class-frequency tracking
-        self.register_buffer("proto_update_count",
-                             torch.zeros(num_classes, dtype=torch.long))
- 
-        # [ENH-4] Prototype quality (EMA of update magnitude)
-        # Khởi tạo = 1.0 → quality trung bình, tránh extreme weight lúc đầu
-        self.register_buffer("proto_variance",
-                             torch.ones(num_classes, dtype=torch.float))
- 
-        self.num_classes        = num_classes
-        self.feat_dim           = feat_dim
-        self.momentum           = momentum
-        self.warmup_steps       = warmup_steps
-        self.temperature        = temperature
-        self.repulsion_coef     = repulsion_coef
-        self.use_freq_weight    = use_freq_weight
-        self.use_quality_weight = use_quality_weight
-        self.use_repulsion      = use_repulsion
- 
-    # ------------------------------------------------------------------
-    # [ENH-1] Adaptive momentum
-    # ------------------------------------------------------------------
- 
-    def _get_momentum(self) -> float:
-        """
-        Tăng dần momentum từ 0.99 → self.momentum theo training progress.
- 
-        Đầu training (step nhỏ): momentum thấp → prototype update nhanh
-        → bắt kịp với features đang thay đổi nhanh.
- 
-        Cuối training (step lớn): momentum cao → prototype ổn định
-        → tránh oscillation khi model đã converge.
- 
-        Transition xảy ra trong khoảng warmup_steps × 10 bước đầu.
-        """
-        if self.warmup_steps <= 0:
-            return self.momentum
-        progress = min(1.0, float(self.step.item()) / max(1, self.warmup_steps * 10))
-        # Linear interpolation: 0.99 → self.momentum
-        return 0.99 + (self.momentum - 0.99) * progress
- 
-    # ------------------------------------------------------------------
-    # Update — EMA per class
-    # ------------------------------------------------------------------
- 
-    @torch.no_grad()
-    def update(self, features: torch.Tensor, labels: torch.Tensor) -> None:
-        if features.numel() == 0:
-            return
- 
-        device     = features.device
-        labels     = labels.to(device)
-        feats_norm = F.normalize(features.float().detach(), dim=-1)
- 
-        # Distributed: gather across GPUs
-        if is_dist_avail_and_initialized():
-            world_size = dist.get_world_size()
- 
-            local_size = torch.tensor([feats_norm.shape[0]],
-                                      dtype=torch.long, device=device)
-            all_sizes  = [torch.zeros(1, dtype=torch.long, device=device)
-                          for _ in range(world_size)]
-            dist.all_gather(all_sizes, local_size)
- 
-            max_size = int(max(s.item() for s in all_sizes))
-            max_size = max(0, min(max_size, 65536))
-            if max_size == 0:
-                return
- 
-            pad_feat  = torch.zeros(max_size, self.feat_dim, device=device)
-            pad_label = torch.full((max_size,), -1,
-                                   dtype=labels.dtype, device=device)
- 
-            n = feats_norm.shape[0]
-            if n > 0:
-                pad_feat[:n]  = feats_norm
-                pad_label[:n] = labels
- 
-            all_feats  = [torch.zeros(max_size, self.feat_dim, device=device)
-                          for _ in range(world_size)]
-            all_labels = [torch.zeros(max_size, dtype=labels.dtype, device=device)
-                          for _ in range(world_size)]
- 
-            dist.all_gather(all_feats,  pad_feat)
-            dist.all_gather(all_labels, pad_label)
- 
-            feats_norm = torch.cat(all_feats,  dim=0)
-            labels     = torch.cat(all_labels, dim=0)
-            valid      = labels >= 0
-            feats_norm = feats_norm[valid]
-            labels     = labels[valid]
- 
-        # [ENH-1] Dùng adaptive momentum
-        momentum = self._get_momentum()
- 
-        for cls_id_t in labels.unique():
-            cls_id   = cls_id_t.item()
-            if cls_id < 0 or cls_id >= self.num_classes:
-                continue
- 
-            cls_mask = labels == cls_id
-            cls_feat = feats_norm[cls_mask].mean(0)
- 
-            if not self.proto_initialized[cls_id]:
-                self.prototypes[cls_id]        = cls_feat
-                self.proto_initialized[cls_id] = True
-            else:
-                old_proto = self.prototypes[cls_id].clone()
- 
-                # EMA update với adaptive momentum
-                self.prototypes[cls_id] = (
-                    momentum * old_proto + (1.0 - momentum) * cls_feat
-                )
- 
-                # [ENH-4] Track update magnitude → quality score
-                update_mag = (cls_feat - old_proto).norm().item()
-                self.proto_variance[cls_id] = (
-                    0.99 * self.proto_variance[cls_id].item()
-                    + 0.01 * update_mag
-                )
- 
-            # [ENH-2] Track update count per class
-            self.proto_update_count[cls_id] += 1
- 
-        self.step += 1
- 
-    # ------------------------------------------------------------------
-    # [ENH-3] Inter-class repulsion loss
-    # ------------------------------------------------------------------
- 
-    def _inter_class_repulsion_loss(self) -> torch.Tensor:
-        """
-        Đẩy prototypes ra xa nhau trong embedding space.
- 
-        Mục tiêu: prototypes của các class khác nhau nên orthogonal
-        (cosine similarity ≈ 0) thay vì gần nhau.
- 
-        Loss = mean cosine similarity của tất cả cặp prototypes.
-        Minimize → prototypes tách biệt nhau hơn.
- 
-        Chỉ tính trên initialized prototypes để tránh zero-vector artifacts.
-        """
-        initialized_idx = self.proto_initialized.nonzero(as_tuple=True)[0]
-        if len(initialized_idx) < 2:
-            return torch.tensor(0.0, device=self.prototypes.device)
- 
-        protos = F.normalize(
-            self.prototypes[initialized_idx].float(), dim=-1
-        )                                                        # (C_init, D)
-        sim    = protos @ protos.T                               # (C_init, C_init)
- 
-        # Chỉ lấy upper triangle — tránh self-similarity và duplicate pairs
-        mask       = torch.triu(
-            torch.ones_like(sim, dtype=torch.bool), diagonal=1
-        )
-        repulsion  = sim[mask].clamp(min=0).mean()   # penalize positive sim
-        return repulsion
- 
-    # ------------------------------------------------------------------
-    # Loss
-    # ------------------------------------------------------------------
- 
-    def loss(
-        self,
-        features: torch.Tensor,
-        labels:   torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Enhanced prototype alignment loss.
- 
-        Thành phần:
-            L_pull = cross-entropy với cosine classifier (có frequency + quality weight)
-            L_push = inter-class repulsion (optional)
- 
-        Total: L = L_pull + repulsion_coef * L_push
- 
-        Args:
-            features: (M, D) — matched query features (raw, chưa normalize)
-            labels:   (M,)  — GT class labels (0-indexed, không tính background)
- 
-        Returns:
-            scalar loss
-        """
-        if features.numel() == 0 or not self.proto_initialized.any():
-            return features.sum() * 0.0
- 
-        # Chỉ tính loss sau warmup
-        if self.step < self.warmup_steps:
-            return features.sum() * 0.0
- 
-        # Lọc những class đã có prototype
-        valid_mask = torch.tensor(
-            [
-                self.proto_initialized[l.item()].item()
-                if 0 <= l.item() < self.num_classes else False
-                for l in labels
-            ],
-            device=features.device,
-        )
-        if not valid_mask.any():
-            return features.sum() * 0.0
- 
-        feats = features[valid_mask]
-        lbls  = labels[valid_mask]
- 
-        # Normalize
-        feats_norm  = F.normalize(feats.float(),           dim=-1)   # (M, D)
-        protos_norm = F.normalize(self.prototypes.float(), dim=-1)   # (C, D)
- 
-        # Cosine logits scaled by temperature
-        logits = feats_norm @ protos_norm.T / self.temperature       # (M, C)
- 
-        # Per-sample cross-entropy (reduction='none' để apply weights)
-        loss_per_sample = F.cross_entropy(logits, lbls.long(),
-                                          reduction='none')           # (M,)
- 
-        # ------------------------------------------------------------------
-        # [ENH-2] Class-frequency weight: rare class → higher weight
-        # ------------------------------------------------------------------
-        if self.use_freq_weight:
-            counts      = self.proto_update_count[lbls.long()].float().clamp(min=1)
-            freq_weight = 1.0 / counts
-            freq_weight = freq_weight / freq_weight.mean().clamp(min=1e-8)
-            freq_weight = freq_weight.clamp(max=5.0)   # cap để tránh extreme
-        else:
-            freq_weight = torch.ones_like(loss_per_sample)
- 
-        # ------------------------------------------------------------------
-        # [ENH-4] Quality weight: stable prototype → higher weight
-        # ------------------------------------------------------------------
-        if self.use_quality_weight:
-            variance      = self.proto_variance[lbls.long()].float().clamp(min=1e-4)
-            quality       = 1.0 / variance
-            quality       = quality / quality.mean().clamp(min=1e-8)
-            quality       = quality.clamp(max=5.0)
-        else:
-            quality = torch.ones_like(loss_per_sample)
- 
-        # Combine weights
-        combined_weight = (freq_weight * quality)
-        combined_weight = combined_weight / combined_weight.mean().clamp(min=1e-8)
- 
-        pull_loss = (loss_per_sample * combined_weight).mean()
- 
-        # ------------------------------------------------------------------
-        # [ENH-3] Inter-class repulsion loss
-        # ------------------------------------------------------------------
-        if self.use_repulsion:
-            push_loss = self._inter_class_repulsion_loss()
-            total_loss = pull_loss + self.repulsion_coef * push_loss
-        else:
-            total_loss = pull_loss
- 
-        return total_loss
- 
-    def extra_repr(self) -> str:
-        return (
-            f"num_classes={self.num_classes}, feat_dim={self.feat_dim}, "
-            f"momentum={self.momentum}, warmup_steps={self.warmup_steps}, "
-            f"temperature={self.temperature}, repulsion_coef={self.repulsion_coef}, "
-            f"use_freq_weight={self.use_freq_weight}, "
-            f"use_quality_weight={self.use_quality_weight}, "
-            f"use_repulsion={self.use_repulsion}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -512,11 +163,6 @@ class LWDETR(nn.Module):
 
             out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
 
-            # Expose last-layer query features cho prototype alignment loss
-            # Chỉ cần khi training — không overhead ở inference
-            if self.training:
-                out['pred_queries'] = hs[-1]   # (B, N, D)
-
             if self.segmentation_head is not None:
                 out['pred_masks'] = outputs_masks[-1]
             if self.aux_loss:
@@ -623,9 +269,6 @@ class SetCriterion(nn.Module):
                  use_position_supervised_loss=False,
                  ia_bce_loss=False,
                  mask_point_sample_ratio: int = 16,
-                 # Prototype alignment params (thay thế contrastive_temperature)
-                 prototype_memory: PrototypeMemory = None,
-                 prototype_loss_coef: float = 1.0,
                  ):
         super().__init__()
         self.num_classes                  = num_classes
@@ -639,8 +282,6 @@ class SetCriterion(nn.Module):
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss                  = ia_bce_loss
         self.mask_point_sample_ratio      = mask_point_sample_ratio
-        self.prototype_memory             = prototype_memory
-        self.prototype_loss_coef          = prototype_loss_coef
 
     # ------------------------------------------------------------------
     # Classification loss
@@ -808,44 +449,6 @@ class SetCriterion(nn.Module):
         return losses
 
     # ------------------------------------------------------------------
-    # Prototype Alignment Loss  ← thay thế InfoNCE
-    # ------------------------------------------------------------------
-
-    def loss_prototype_align(self, outputs, targets, indices, num_boxes):
-        if 'pred_queries' not in outputs or self.prototype_memory is None:
-            return {}
-
-        query_feats = outputs['pred_queries']   # (B, N, D) — trên GPU
-        device = query_feats.device
-
-        all_feats:  list[torch.Tensor] = []
-        all_labels: list[torch.Tensor] = []
-
-        for b_idx, (src_idx, tgt_idx) in enumerate(indices):
-            if len(src_idx) == 0:
-                continue
-            # FIX: move indices lên cùng device với query_feats
-            src_idx = src_idx.to(device)
-            tgt_idx = tgt_idx.to(device)
-
-            lbls  = targets[b_idx]['labels'][tgt_idx]
-            valid = lbls < self.num_classes
-            if not valid.any():
-                continue
-            all_feats.append(query_feats[b_idx, src_idx[valid]])
-            all_labels.append(lbls[valid])
-
-        if len(all_feats) == 0:
-            return {'loss_proto_align': query_feats.sum() * 0.0}
-
-        feats  = torch.cat(all_feats,  dim=0)
-        labels = torch.cat(all_labels, dim=0)
-
-        self.prototype_memory.update(feats, labels)
-        loss = self.prototype_memory.loss(feats, labels)
-        return {'loss_proto_align': loss}
-
-    # ------------------------------------------------------------------
     # Loss dispatch
     # ------------------------------------------------------------------
 
@@ -861,11 +464,10 @@ class SetCriterion(nn.Module):
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
-            'labels':          self.loss_labels,
-            'cardinality':     self.loss_cardinality,
-            'boxes':           self.loss_boxes,
-            'masks':           self.loss_masks,
-            'prototype_align': self.loss_prototype_align,
+            'labels':      self.loss_labels,
+            'cardinality': self.loss_cardinality,
+            'boxes':       self.loss_boxes,
+            'masks':       self.loss_masks,
         }
         assert loss in loss_map, f'Unknown loss: {loss}'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -893,9 +495,6 @@ class SetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices_i = self.matcher(aux_outputs, targets, group_detr=group_detr)
                 for loss in self.losses:
-                    # prototype_align chỉ apply ở last decoder layer
-                    if loss == 'prototype_align':
-                        continue
                     kwargs = {'log': False} if loss == 'labels' else {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_i, num_boxes, **kwargs)
                     losses.update({k + f'_{i}': v for k, v in l_dict.items()})
@@ -904,8 +503,6 @@ class SetCriterion(nn.Module):
             enc_outputs = outputs['enc_outputs']
             indices_e   = self.matcher(enc_outputs, targets, group_detr=group_detr)
             for loss in self.losses:
-                if loss == 'prototype_align':
-                    continue
                 kwargs = {'log': False} if loss == 'labels' else {}
                 l_dict = self.get_loss(loss, enc_outputs, targets, indices_e, num_boxes, **kwargs)
                 losses.update({k + '_enc': v for k, v in l_dict.items()})
@@ -1092,57 +689,19 @@ def build_criterion_and_postprocessors(args):
     if args.segmentation_head:
         weight_dict['loss_mask_ce']   = args.mask_ce_loss_coef
         weight_dict['loss_mask_dice'] = args.mask_dice_loss_coef
- 
-    # ------------------------------------------------------------------
-    # Prototype alignment loss — Enhanced PrototypeMemory
-    # ------------------------------------------------------------------
-    prototype_memory = None
-    use_proto = getattr(args, 'use_prototype_align', True)
- 
-    if use_proto:
-        proto_coef = getattr(args, 'prototype_loss_coef', 0.1)
-        weight_dict['loss_proto_align'] = proto_coef
- 
-        prototype_memory = PrototypeMemory(
-            num_classes        = args.num_classes,
-            feat_dim           = args.hidden_dim,
-            momentum           = getattr(args, 'prototype_momentum',           0.999),
-            warmup_steps       = getattr(args, 'prototype_warmup_steps',       200),
-            temperature        = getattr(args, 'prototype_temperature',        0.1),
-            # [ENH-3] Inter-class repulsion
-            repulsion_coef     = getattr(args, 'prototype_repulsion_coef',     0.1),
-            # [ENH-2] Class-frequency weighting
-            use_freq_weight    = getattr(args, 'prototype_use_freq_weight',    True),
-            # [ENH-4] Prototype quality weighting
-            use_quality_weight = getattr(args, 'prototype_use_quality_weight', True),
-            # [ENH-3] Toggle repulsion
-            use_repulsion      = getattr(args, 'prototype_use_repulsion',      True),
-        )
-        prototype_memory.to(device)
- 
-    # ------------------------------------------------------------------
-    # Aux loss weight dict
-    # ------------------------------------------------------------------
+
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({
-                k + f'_{i}': v for k, v in weight_dict.items()
-                if k != 'loss_proto_align'
-            })
+            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         if args.two_stage:
-            aux_weight_dict.update({
-                k + '_enc': v for k, v in weight_dict.items()
-                if k != 'loss_proto_align'
-            })
+            aux_weight_dict.update({k + '_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
- 
+
     losses = ['labels', 'boxes', 'cardinality']
     if args.segmentation_head:
         losses.append('masks')
-    if use_proto:
-        losses.append('prototype_align')
- 
+
     criterion_kwargs = dict(
         focal_alpha=args.focal_alpha,
         losses=losses,
@@ -1151,8 +710,6 @@ def build_criterion_and_postprocessors(args):
         use_varifocal_loss=args.use_varifocal_loss,
         use_position_supervised_loss=args.use_position_supervised_loss,
         ia_bce_loss=args.ia_bce_loss,
-        prototype_memory=prototype_memory,
-        prototype_loss_coef=getattr(args, 'prototype_loss_coef', 0.1),
     )
     if args.segmentation_head:
         criterion_kwargs['mask_point_sample_ratio'] = args.mask_point_sample_ratio

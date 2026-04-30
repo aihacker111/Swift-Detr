@@ -64,17 +64,6 @@ USE_CONVNEXT_PROJECTOR = True
 USE_WINDOWED_ATTN      = False
 FREEZE_ENCODER         = False   # True = chỉ train decoder (tốt cho very small data)
 
-# Prototype alignment
-USE_PROTOTYPE_ALIGN       = True
-PROTOTYPE_LOSS_COEF       = 0.1
-PROTOTYPE_MOMENTUM        = 0.999
-PROTOTYPE_WARMUP_STEPS    = 200
-PROTOTYPE_TEMPERATURE     = 0.1
-PROTOTYPE_REPULSION_COEF  = 0.1
-PROTOTYPE_USE_FREQ_WEIGHT    = True
-PROTOTYPE_USE_QUALITY_WEIGHT = True
-PROTOTYPE_USE_REPULSION      = True
-
 # ─── MAIN (không sửa) ─────────────────────────────────────────────────────────
 
 def main():
@@ -139,15 +128,6 @@ def main():
         bbox_loss_coef=BBOX_LOSS_COEF,
         giou_loss_coef=GIOU_LOSS_COEF,
         use_convnext_projector=USE_CONVNEXT_PROJECTOR,
-        use_prototype_align=USE_PROTOTYPE_ALIGN,
-        prototype_loss_coef=PROTOTYPE_LOSS_COEF,
-        prototype_momentum=PROTOTYPE_MOMENTUM,
-        prototype_warmup_steps=PROTOTYPE_WARMUP_STEPS,
-        prototype_temperature=PROTOTYPE_TEMPERATURE,
-        prototype_repulsion_coef=PROTOTYPE_REPULSION_COEF,
-        prototype_use_freq_weight=PROTOTYPE_USE_FREQ_WEIGHT,
-        prototype_use_quality_weight=PROTOTYPE_USE_QUALITY_WEIGHT,
-        prototype_use_repulsion=PROTOTYPE_USE_REPULSION,
         freeze_encoder=FREEZE_ENCODER,
     )
 
