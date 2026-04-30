@@ -146,7 +146,7 @@ def main() -> None:
         weights_by_size=SWIFTNET_WEIGHTS_BY_SIZE,
     )
 
-    use_convnext = not args.no_use_convnext_projector
+    use_convnext = not args.no_convnext_projector
     model_kw = dict(
         pretrained_encoder=pretrained_path,
         use_windowed_attn=args.use_windowed_attn,
