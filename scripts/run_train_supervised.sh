@@ -19,7 +19,7 @@ SCRIPT_DIR=$(cd "$SCRIPT_DIR" && pwd)
 TRAIN_PY="${SCRIPT_DIR}/train_supervised.py"
 
 DATASET_DIR="${DATASET_DIR:-/workspace/coco}"
-OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output/swiftdetr_base_supervised}"
+OUTPUT_DIR="${OUTPUT_DIR:-/workspace/Swift-Detr/output/swiftdetr_base_supervised}"
 NUM_GPUS="${NUM_GPUS:-4}"
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
 MASTER_PORT="${MASTER_PORT:-29500}"
