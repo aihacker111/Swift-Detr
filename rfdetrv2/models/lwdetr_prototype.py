@@ -10,9 +10,10 @@ LW-DETR model and criterion classes.
 
 import copy
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
+import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 
@@ -34,6 +35,53 @@ from rfdetrv2.util.misc import (
     nested_tensor_from_tensor_list,
 )
 
+
+# ---------------------------------------------------------------------------
+# Prototype memory (EMA class prototypes for alignment loss)
+# ---------------------------------------------------------------------------
+
+class PrototypeMemory(nn.Module):
+    """Maintains L2-normalized class prototypes via EMA over matched query features."""
+
+    def __init__(self, num_classes: int, feat_dim: int, momentum: float = 0.999):
+        super().__init__()
+        self.num_classes = num_classes
+        self.momentum = momentum
+        self.register_buffer("prototypes", torch.zeros(num_classes, feat_dim))
+        self.register_buffer("proto_mask", torch.zeros(num_classes, dtype=torch.bool))
+
+    @torch.no_grad()
+    def update(self, feats: torch.Tensor, labels: torch.Tensor) -> None:
+        """feats: (N, D), detached, matching labels; labels in [0, num_classes-1]."""
+        if feats.numel() == 0:
+            return
+        device = feats.device
+        dtype = feats.dtype
+        d = feats.shape[1]
+        sum_buf = torch.zeros(self.num_classes, d, device=device, dtype=dtype)
+        cnt_buf = torch.zeros(self.num_classes, device=device, dtype=dtype)
+        for c in labels.unique():
+            ci = int(c.item())
+            if ci < 0 or ci >= self.num_classes:
+                continue
+            m = labels == c
+            sum_buf[ci] = feats[m].sum(0)
+            cnt_buf[ci] = m.sum().to(dtype)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(sum_buf, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(cnt_buf, op=torch.distributed.ReduceOp.SUM)
+        for c in range(self.num_classes):
+            if cnt_buf[c] < 0.5:
+                continue
+            cls_feat = sum_buf[c] / cnt_buf[c]
+            cls_feat = F.normalize(cls_feat.unsqueeze(0), dim=-1).squeeze(0)
+            if not self.proto_mask[c]:
+                self.prototypes[c].copy_(cls_feat)
+                self.proto_mask[c] = True
+            else:
+                p = self.momentum * self.prototypes[c] + (1 - self.momentum) * cls_feat
+                p = F.normalize(p.unsqueeze(0), dim=-1).squeeze(0)
+                self.prototypes[c].copy_(p)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +218,8 @@ class LWDETR(nn.Module):
                     outputs_class, outputs_coord,
                     outputs_masks if self.segmentation_head is not None else None,
                 )
+            if self.training:
+                out['pred_queries'] = hs[-1]
 
         if self.two_stage:
             group_detr  = self.group_detr if self.training else 1
@@ -269,6 +319,9 @@ class SetCriterion(nn.Module):
                  use_position_supervised_loss=False,
                  ia_bce_loss=False,
                  mask_point_sample_ratio: int = 16,
+                 prototype_memory: Optional[PrototypeMemory] = None,
+                 prototype_warmup_epochs: float = 0.0,
+                 prototype_repulsion_coef: float = 0.0,
                  ):
         super().__init__()
         self.num_classes                  = num_classes
@@ -282,6 +335,17 @@ class SetCriterion(nn.Module):
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss                  = ia_bce_loss
         self.mask_point_sample_ratio      = mask_point_sample_ratio
+        self.prototype_memory             = prototype_memory
+        self.prototype_warmup_epochs      = prototype_warmup_epochs
+        self.prototype_repulsion_coef     = prototype_repulsion_coef
+        self.register_buffer("_epoch_buf", torch.tensor(0, dtype=torch.long))
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch_buf.fill_(int(epoch))
+
+    @property
+    def current_epoch(self) -> int:
+        return int(self._epoch_buf.item())
 
     # ------------------------------------------------------------------
     # Classification loss
@@ -448,6 +512,40 @@ class SetCriterion(nn.Module):
         del src_masks, target_masks
         return losses
 
+    def loss_prototype_align(self, outputs, targets, indices, num_boxes, **kwargs):
+        if self.prototype_memory is None or 'pred_queries' not in outputs:
+            ref = outputs.get('pred_logits', outputs.get('pred_boxes'))
+            dev, dt = ref.device, ref.dtype
+            return {'loss_proto_align': torch.zeros((), device=dev, dtype=dt)}
+        pred_q = outputs['pred_queries']
+        idx = self._get_src_permutation_idx(indices)
+        if idx[0].numel() == 0:
+            return {'loss_proto_align': torch.zeros((), device=pred_q.device, dtype=pred_q.dtype)}
+        batch_idx, src_idx = idx
+        target_classes = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        q = pred_q[batch_idx, src_idx]
+        q = F.normalize(q, dim=-1)
+        self.prototype_memory.update(q.detach(), target_classes)
+        mask = self.prototype_memory.proto_mask[target_classes]
+        if not mask.any():
+            return {'loss_proto_align': (q * 0).mean()}
+        proto = self.prototype_memory.prototypes[target_classes].detach()
+        cos = (q * proto).sum(dim=-1).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        loss = ((1.0 - cos) * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+        if self.prototype_repulsion_coef > 0 and self.prototype_memory.proto_mask.sum() > 1:
+            P = self.prototype_memory.prototypes[self.prototype_memory.proto_mask]
+            Pn = F.normalize(P, dim=-1)
+            sim = Pn @ Pn.T
+            c = sim.shape[0]
+            off = ~torch.eye(c, dtype=torch.bool, device=sim.device)
+            rep = (sim * off.float()).pow(2).sum() / off.float().sum().clamp(min=1.0)
+            loss = loss + self.prototype_repulsion_coef * rep
+        wu = self.prototype_warmup_epochs
+        if wu > 0:
+            scale = min(1.0, (self.current_epoch + 1) / wu)
+            loss = loss * scale
+        return {'loss_proto_align': loss}
+
     # ------------------------------------------------------------------
     # Loss dispatch
     # ------------------------------------------------------------------
@@ -464,10 +562,11 @@ class SetCriterion(nn.Module):
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
-            'labels':      self.loss_labels,
-            'cardinality': self.loss_cardinality,
-            'boxes':       self.loss_boxes,
-            'masks':       self.loss_masks,
+            'labels':           self.loss_labels,
+            'cardinality':      self.loss_cardinality,
+            'boxes':            self.loss_boxes,
+            'masks':            self.loss_masks,
+            'prototype_align':  self.loss_prototype_align,
         }
         assert loss in loss_map, f'Unknown loss: {loss}'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -489,12 +588,18 @@ class SetCriterion(nn.Module):
 
         losses = {}
         for loss in self.losses:
+            if loss == 'prototype_align':
+                continue
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+        if 'prototype_align' in self.losses and self.prototype_memory is not None:
+            losses.update(self.get_loss('prototype_align', outputs, targets, indices, num_boxes))
 
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices_i = self.matcher(aux_outputs, targets, group_detr=group_detr)
                 for loss in self.losses:
+                    if loss == 'prototype_align':
+                        continue
                     kwargs = {'log': False} if loss == 'labels' else {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_i, num_boxes, **kwargs)
                     losses.update({k + f'_{i}': v for k, v in l_dict.items()})
@@ -503,6 +608,8 @@ class SetCriterion(nn.Module):
             enc_outputs = outputs['enc_outputs']
             indices_e   = self.matcher(enc_outputs, targets, group_detr=group_detr)
             for loss in self.losses:
+                if loss == 'prototype_align':
+                    continue
                 kwargs = {'log': False} if loss == 'labels' else {}
                 l_dict = self.get_loss(loss, enc_outputs, targets, indices_e, num_boxes, **kwargs)
                 losses.update({k + '_enc': v for k, v in l_dict.items()})
@@ -698,9 +805,22 @@ def build_criterion_and_postprocessors(args):
             aux_weight_dict.update({k + '_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
+    if getattr(args, 'use_prototype_align', False):
+        weight_dict['loss_proto_align'] = getattr(args, 'prototype_loss_coef', 1.0)
+
     losses = ['labels', 'boxes', 'cardinality']
     if args.segmentation_head:
         losses.append('masks')
+    if getattr(args, 'use_prototype_align', False):
+        losses.append('prototype_align')
+
+    prototype_memory = None
+    if getattr(args, 'use_prototype_align', False):
+        prototype_memory = PrototypeMemory(
+            num_classes=args.num_classes,
+            feat_dim=args.hidden_dim,
+            momentum=getattr(args, 'prototype_momentum', 0.999),
+        )
 
     criterion_kwargs = dict(
         focal_alpha=args.focal_alpha,
@@ -710,6 +830,9 @@ def build_criterion_and_postprocessors(args):
         use_varifocal_loss=args.use_varifocal_loss,
         use_position_supervised_loss=args.use_position_supervised_loss,
         ia_bce_loss=args.ia_bce_loss,
+        prototype_memory=prototype_memory,
+        prototype_warmup_epochs=getattr(args, 'prototype_warmup_epochs', 0.0),
+        prototype_repulsion_coef=getattr(args, 'prototype_repulsion_coef', 0.0),
     )
     if args.segmentation_head:
         criterion_kwargs['mask_point_sample_ratio'] = args.mask_point_sample_ratio

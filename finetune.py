@@ -58,6 +58,11 @@ CLS_LOSS_COEF        = 1.0
 BBOX_LOSS_COEF       = 5.0
 GIOU_LOSS_COEF       = 2.0
 USE_VARIFOCAL_LOSS   = False
+USE_PROTOTYPE_ALIGN   = False  # EMA class prototypes + cosine alignment on matched queries
+PROTOTYPE_LOSS_COEF  = 0.1
+PROTOTYPE_MOMENTUM   = 0.999
+PROTOTYPE_WARMUP_EPOCHS = 0.0
+PROTOTYPE_REPULSION_COEF = 0.0
 
 # Architecture
 USE_CONVNEXT_PROJECTOR = True
@@ -124,6 +129,11 @@ def main():
         lr_restart_period=LR_RESTART_PERIOD,
         lr_restart_decay=LR_RESTART_DECAY,
         use_varifocal_loss=USE_VARIFOCAL_LOSS,
+        use_prototype_align=USE_PROTOTYPE_ALIGN,
+        prototype_loss_coef=PROTOTYPE_LOSS_COEF,
+        prototype_momentum=PROTOTYPE_MOMENTUM,
+        prototype_warmup_epochs=PROTOTYPE_WARMUP_EPOCHS,
+        prototype_repulsion_coef=PROTOTYPE_REPULSION_COEF,
         cls_loss_coef=CLS_LOSS_COEF,
         bbox_loss_coef=BBOX_LOSS_COEF,
         giou_loss_coef=GIOU_LOSS_COEF,

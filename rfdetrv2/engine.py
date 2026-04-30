@@ -2012,6 +2012,9 @@ def train_one_epoch(
     header = "Epoch: [{}]".format(epoch)
     print_freq = 10
     start_steps = epoch * num_training_steps_per_epoch
+
+    if hasattr(criterion, "set_epoch"):
+        criterion.set_epoch(epoch)
  
     print("Grad accum steps: ", args.grad_accum_steps)
     print("Total batch size: ", batch_size * utils.get_world_size())

@@ -1,6 +1,6 @@
 # RF-DETR (rfdetrv2)
 
-Object detection built on RF-DETR with DINOv3 backbones and supervised training.
+Object detection built on RF-DETR with DINOv3 backbones, supervised training, and optional prototype alignment.
 
 ## Layout
 

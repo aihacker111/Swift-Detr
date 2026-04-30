@@ -853,6 +853,12 @@ def get_args_parser():
     parser.add_argument('--use_position_supervised_loss', action='store_true')
     parser.add_argument('--ia_bce_loss',                  action='store_true')
 
+    parser.add_argument('--use_prototype_align',          action='store_true')
+    parser.add_argument('--prototype_loss_coef',          default=0.1,  type=float)
+    parser.add_argument('--prototype_momentum',           default=0.999, type=float)
+    parser.add_argument('--prototype_warmup_epochs',       default=0.0,  type=float)
+    parser.add_argument('--prototype_repulsion_coef',     default=0.0,  type=float)
+
     parser.add_argument('--no_convnext_projector',        action='store_true', dest='no_use_convnext_projector')
 
     # Dataset
@@ -1005,6 +1011,11 @@ def populate_args(
     use_varifocal_loss=False,
     use_position_supervised_loss=False,
     ia_bce_loss=False,
+    use_prototype_align=False,
+    prototype_loss_coef=0.1,
+    prototype_momentum=0.999,
+    prototype_warmup_epochs=0.0,
+    prototype_repulsion_coef=0.0,
     # Dataset
     dataset_file="coco",
     coco_path=None,
@@ -1122,6 +1133,11 @@ def populate_args(
         use_varifocal_loss=use_varifocal_loss,
         use_position_supervised_loss=use_position_supervised_loss,
         ia_bce_loss=ia_bce_loss,
+        use_prototype_align=use_prototype_align,
+        prototype_loss_coef=prototype_loss_coef,
+        prototype_momentum=prototype_momentum,
+        prototype_warmup_epochs=prototype_warmup_epochs,
+        prototype_repulsion_coef=prototype_repulsion_coef,
         dataset_file=dataset_file,
         coco_path=coco_path,
         dataset_dir=dataset_dir,

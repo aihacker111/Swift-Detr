@@ -66,6 +66,7 @@ if [ -n "${PRETRAINED_ENCODER}" ]; then
     --model-size "${MODEL_SIZE}" \
     --pretrained-encoder "${PRETRAINED_ENCODER}" \
     --use-varifocal-loss \
+    --use_prototype_align \
     --tensorboard
 else
   torchrun --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
@@ -77,6 +78,7 @@ else
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --use-varifocal-loss \
+    --use_prototype_align \
     --tensorboard
 fi
 

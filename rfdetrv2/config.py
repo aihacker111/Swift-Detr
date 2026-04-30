@@ -153,6 +153,11 @@ class TrainConfig(BaseModel):
     segmentation_head: bool = False
     eval_max_dets: int = 500
     freeze_encoder: bool = False  # Freeze SwiftNet backbone (no gradient update)
+    use_prototype_align: bool = False  # EMA class prototypes + cosine alignment on decoder queries
+    prototype_loss_coef: float = 0.1
+    prototype_momentum: float = 0.999
+    prototype_warmup_epochs: float = 0.0  # 0 = no ramp; else scale loss by min(1, (epoch+1)/value)
+    prototype_repulsion_coef: float = 0.0  # Penalize high similarity between different prototypes
 
     @field_validator("dataset_dir", "output_dir", "coco_path", mode="after")
     @classmethod

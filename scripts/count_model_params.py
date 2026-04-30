@@ -77,6 +77,8 @@ def populate_args(**extra_kwargs):
         cls_loss_coef=1.0, bbox_loss_coef=5.0, giou_loss_coef=2.0, focal_alpha=0.25,
         aux_loss=True, sum_group_losses=False, use_varifocal_loss=False,
         use_position_supervised_loss=False, ia_bce_loss=False,
+        use_prototype_align=False, prototype_loss_coef=0.1, prototype_momentum=0.999,
+        prototype_warmup_epochs=0.0, prototype_repulsion_coef=0.0,
         dataset_file="coco", coco_path=None, dataset_dir=None, square_resize_div_64=False,
         output_dir="output", dont_save_weights=False, checkpoint_interval=10, seed=42,
         resume="", start_epoch=0, eval=False, use_ema=False, ema_decay=0.9997, ema_tau=0,

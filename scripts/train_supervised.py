@@ -111,6 +111,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     loss = p.add_argument_group("loss")
     loss.add_argument("--use-varifocal-loss", action="store_true")
+    loss.add_argument("--use-prototype-align", action="store_true", help="EMA class prototypes + query alignment loss")
+    loss.add_argument("--prototype-loss-coef", type=float, default=0.1)
+    loss.add_argument("--prototype-momentum", type=float, default=0.999)
+    loss.add_argument("--prototype-warmup-epochs", type=float, default=0.0)
+    loss.add_argument("--prototype-repulsion-coef", type=float, default=0.0)
     loss.add_argument("--cls-loss-coef", type=float, default=1.0)
     loss.add_argument("--bbox-loss-coef", type=float, default=5.0)
     loss.add_argument("--giou-loss-coef", type=float, default=2.0)
@@ -163,6 +168,11 @@ def main() -> None:
         lr_restart_period=args.lr_restart_period,
         lr_restart_decay=args.lr_restart_decay,
         use_varifocal_loss=args.use_varifocal_loss,
+        use_prototype_align=args.use_prototype_align,
+        prototype_loss_coef=args.prototype_loss_coef,
+        prototype_momentum=args.prototype_momentum,
+        prototype_warmup_epochs=args.prototype_warmup_epochs,
+        prototype_repulsion_coef=args.prototype_repulsion_coef,
         cls_loss_coef=args.cls_loss_coef,
         bbox_loss_coef=args.bbox_loss_coef,
         giou_loss_coef=args.giou_loss_coef,
