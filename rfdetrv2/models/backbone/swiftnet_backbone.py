@@ -2,7 +2,9 @@
 SwiftNet backbone encoder for RF-DETR.
 
 Wraps SWIFTNet (CNN stem + Hybrid Transformer) as a feature extractor:
-  - Classification head is removed; only stem, stages and mergers are used.
+  - Classification head is omitted; stem, stages, mergers, and the same
+    pre-head LayerNorm as SWIFTNet.forward_features are kept so ImageNet
+    checkpoints load including norm.* (head.* / fc.* / classifier.* dropped).
   - forward() extracts features from all 4 stages and resamples them to a
     common spatial resolution (stage-2: H/16, W/16) so the existing
     MultiScaleProjector can consume them unchanged.
@@ -60,8 +62,9 @@ class SwiftNetEncoder(nn.Module):
     standard 640-px input) so the MultiScaleProjector can process them
     identically to DINOv3 intermediate layer features.
 
-    The classification head is stripped; weights from an ImageNet-1k
-    pretrained checkpoint can be loaded via *pretrained_encoder*.
+    The classification head is stripped; the final backbone LayerNorm before
+    the head is kept and loaded from ImageNet checkpoints. Weights from an
+    ImageNet-1k pretrained checkpoint can be loaded via *pretrained_encoder*.
     """
 
     def __init__(
@@ -84,12 +87,13 @@ class SwiftNetEncoder(nn.Module):
         config = SWIFTNetConfig(**cfg_kw, num_classes=0)
         model  = SWIFTNet(config)
 
-        # ── Strip the classification head ──────────────────────────────
-        model.head = nn.Identity()
-
+        # Final LayerNorm before the classifier (same as SWIFTNet.forward_features).
+        # ImageNet checkpoints include norm.{weight,bias}; without this submodule
+        # they show up as unexpected keys and the last stage is not normalized.
         self.stem       = model.stem
         self.stages     = model.stages
         self.mergers    = model.mergers
+        self.norm       = model.norm
         self.num_stages = len(model.stages)
 
         # Stage 2 is the reference: H/16 × W/16 for a 640-px input
@@ -124,11 +128,13 @@ class SwiftNetEncoder(nn.Module):
         state_dict = checkpoint.get("model", checkpoint)
 
         # Drop classification head weights — shape will not match (num_classes differs)
-        head_keys = [k for k in list(state_dict.keys()) if k.startswith("head.")]
-        for k in head_keys:
-            del state_dict[k]
+        # Classification / distillation head only — not used for detection.
+        drop_prefixes = ("head.", "heaad_dist.", "fc.", "classifier.")
+        for k in list(state_dict.keys()):
+            if any(k.startswith(p) for p in drop_prefixes):
+                del state_dict[k]
 
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        missing, unexpected = self.load_state_dict(state_dict, strict=True)
         if missing:
             logger.info(
                 "SwiftNetEncoder: missing keys after pretrained load "
@@ -171,6 +177,9 @@ class SwiftNetEncoder(nn.Module):
         for si, stage in enumerate(self.stages):
             for block in stage:
                 tokens = block(tokens, H, W)
+
+            if si == self.num_stages - 1:
+                tokens = self.norm(tokens)
 
             # Tokens → spatial feature map (B, C, H_i, W_i)
             C    = tokens.shape[-1]
