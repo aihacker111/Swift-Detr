@@ -57,6 +57,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--num-workers", type=int, default=8, help="DataLoader workers per process")
     run.add_argument("--epochs", type=int, default=50)
     run.add_argument("--grad-accum-steps", type=int, default=4)
+    run.add_argument("--resume", default="", help="Path to checkpoint.pth to resume from (restores model, optimizer, lr_scheduler, and epoch)")
     run.add_argument("--run-test", action="store_true", help="Run validation after training")
     run.add_argument("--tensorboard", action="store_true", default=True)
     run.add_argument("--no-tensorboard", action="store_false", dest="tensorboard")
@@ -157,6 +158,7 @@ def main() -> None:
         device="cuda",
         output_dir=args.output_dir,
         debug_data_limit=0,
+        resume=args.resume,
         amp=args.amp,
         tensorboard=args.tensorboard,
         warmup_epochs=1,

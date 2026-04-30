@@ -9,6 +9,7 @@
 #   CUDA_VISIBLE_DEVICES - which GPUs to use (default below: 0,1,2,3)
 #   MODEL_SIZE           - tiny | small | base (default: base)
 #   PRETRAINED_ENCODER   - path to SwiftNet encoder .pth (passed as --pretrained-encoder when set)
+#   RESUME               - path to checkpoint.pth to resume from (e.g. $OUTPUT_DIR/checkpoint.pth)
 
 set -e
 
@@ -21,10 +22,11 @@ TRAIN_PY="${SCRIPT_DIR}/train_supervised.py"
 DATASET_DIR="${DATASET_DIR:-/workspace/coco}"
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/Swift-Detr/output/swiftdetr_base_supervised}"
 NUM_GPUS="${NUM_GPUS:-4}"
-BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
+BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 MODEL_SIZE="${MODEL_SIZE:-base}"
 PRETRAINED_ENCODER="${PRETRAINED_ENCODER:-/workspace/Swift-Detr/checkpoints/swift_net_base/2026_04_26_15_28_59/checkpoint_best.pth}"
+RESUME="${RESUME:-}"
 
 echo "Checking GPUs..."
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -54,6 +56,14 @@ if [ -n "${PRETRAINED_ENCODER}" ]; then
 else
   echo "  pretrained_encoder: (unset — train_supervised resolves swiftnet_pretrained/ or env PRETRAINED_ENCODER)"
 fi
+if [ -n "${RESUME}" ]; then
+  echo "  resume: ${RESUME}"
+fi
+
+RESUME_ARG=""
+if [ -n "${RESUME}" ]; then
+  RESUME_ARG="--resume ${RESUME}"
+fi
 
 if [ -n "${PRETRAINED_ENCODER}" ]; then
   torchrun --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
@@ -65,9 +75,11 @@ if [ -n "${PRETRAINED_ENCODER}" ]; then
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --pretrained-encoder "${PRETRAINED_ENCODER}" \
+    --amp \
     --use-varifocal-loss \
     --use-prototype-align \
-    --tensorboard
+    --tensorboard \
+    ${RESUME_ARG}
 else
   torchrun --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
     "${TRAIN_PY}" \
@@ -77,9 +89,11 @@ else
     --num-workers 16 \
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
+    --amp \
     --use-varifocal-loss \
     --use-prototype-align \
-    --tensorboard
+    --tensorboard \
+    ${RESUME_ARG}
 fi
 
 echo "Done."
