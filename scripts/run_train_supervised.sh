@@ -1,25 +1,34 @@
 #!/usr/bin/env bash
-# RF-DETR supervised training (multi-GPU via torchrun).
+# SwiftDetr supervised training (multi-GPU via torchrun).
 #
 # Environment (optional):
-#   DATASET_DIR   - COCO root (default: /workspace/coco_2017)
-#   OUTPUT_DIR    - run output (default: /workspace/output/rfdetrv2_small_supervised)
-#   NUM_GPUS      - torchrun --nproc_per_node (default: 2)
-#   MASTER_PORT   - distributed rendezvous port (default: 29500)
+#   DATASET_DIR          - COCO root (default: /workspace/coco_2017)
+#   OUTPUT_DIR           - run output (default: /workspace/output/swiftdetr_base_supervised)
+#   NUM_GPUS             - torchrun --nproc_per_node (default: 2)
+#   MASTER_PORT          - distributed rendezvous port (default: 29500)
 #   CUDA_VISIBLE_DEVICES - which GPUs to use (default below: 0,1)
+#   MODEL_SIZE           - tiny | small | base (default: base)
+#   PRETRAINED_ENCODER   - path to SwiftNet encoder .pth (passed as --pretrained-encoder when set)
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly TRAIN_PY="${SCRIPT_DIR}/train_supervised.py"
 
-DATASET_DIR="${DATASET_DIR:-/workspace/coco_2017}"
-OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output/rfdetrv2_small_supervised}"
-NUM_GPUS="${NUM_GPUS:-2}"
+DATASET_DIR="${DATASET_DIR:-/workspace/coco}"
+OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output/swiftdetr_base_supervised}"
+NUM_GPUS="${NUM_GPUS:-4}"
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-16}"
 MASTER_PORT="${MASTER_PORT:-29500}"
+MODEL_SIZE="${MODEL_SIZE:-base}"
+PRETRAINED_ENCODER="${PRETRAINED_ENCODER:-/workspace/Swift-Detr/checkpoints/swift_net_base/2026_04_26_15_28_59/checkpoint_best.pth}"
+
+PRETRAIN_ARGS=()
+if [[ -n "${PRETRAINED_ENCODER}" ]]; then
+  PRETRAIN_ARGS+=(--pretrained-encoder "${PRETRAINED_ENCODER}")
+fi
 
 echo "Checking GPUs..."
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -42,15 +51,22 @@ fi
 echo "Starting supervised training: ${NUM_GPUS} process(es)"
 echo "  dataset: ${DATASET_DIR}"
 echo "  output:  ${OUTPUT_DIR}"
+echo "  model:   ${MODEL_SIZE}"
+if [[ -n "${PRETRAINED_ENCODER}" ]]; then
+  echo "  pretrained_encoder: ${PRETRAINED_ENCODER}"
+else
+  echo "  pretrained_encoder: (unset — train_supervised resolves swiftnet_pretrained/ or env PRETRAINED_ENCODER)"
+fi
 
 torchrun --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
   "${TRAIN_PY}" \
   --dataset-dir "${DATASET_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
   --batch-size "${BATCH_SIZE_PER_GPU}" \
-  --num-workers 4 \
+  --num-workers 16 \
   --epochs 50 \
-  --model-size small \
+  --model-size "${MODEL_SIZE}" \
+  "${PRETRAIN_ARGS[@]}" \
   --use-varifocal-loss \
   --tensorboard
 
