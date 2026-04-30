@@ -810,9 +810,11 @@ def train_one_epoch(
                 model.update_dropout(schedules["do"][it])
  
         if args.multi_scale and not args.do_random_resize_via_padding:
+            patch_size = getattr(args, "patch_size", 16)
+            num_windows = getattr(args, "num_windows", 4)
             scales = compute_multi_scale_scales(
                 args.resolution, args.expanded_scales,
-                args.patch_size, args.num_windows,
+                patch_size, num_windows,
             )
             random.seed(it)
             scale = random.choice(scales)
