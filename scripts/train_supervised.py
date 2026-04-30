@@ -168,7 +168,7 @@ def main() -> None:
         run_test=args.run_test,
         device="cuda",
         output_dir=args.output_dir,
-        debug_data_limit=0,
+        debug_data_limit=1000,
         amp=args.amp,
         tensorboard=args.tensorboard,
         warmup_epochs=1,
