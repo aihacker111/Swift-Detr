@@ -59,7 +59,7 @@ else
 fi
 
 torchrun --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
-  "${TRAIN_PY}" \
+  /Users/tinvo0908/Downloads/swift-detr/Swift-Detr/scripts/train_supervised.py \
   --dataset-dir "${DATASET_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
   --batch-size "${BATCH_SIZE_PER_GPU}" \
