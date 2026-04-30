@@ -98,7 +98,7 @@ class SwiftDetrBaseConfig(ModelConfig):
     num_select: int = 300
     projector_scale: List[Literal["P3", "P4", "P5"]] = ["P3", "P4", "P5"]
     pretrain_weights: Optional[str] = None
-    resolution: int = 640
+    resolution: int = 512
 
 
 # --- Deprecated aliases (RF-DETR naming) ---
