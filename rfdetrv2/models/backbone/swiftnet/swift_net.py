@@ -179,7 +179,7 @@ class SWIFTNet(nn.Module):
 
         self.config       = config
         self.num_stages   = len(config.dims)
-        self.global_pool  = config.global_pool
+        # self.global_pool  = config.global_pool
         self.num_features = config.dims[-1]
 
         # feature_info: stem is 4× reduction; each merge doubles it
@@ -206,14 +206,14 @@ class SWIFTNet(nn.Module):
 
         self.norm = nn.LayerNorm(self.num_features)
 
-        self.head = SWIFTNetHead(
-            dim=self.num_features,
-            num_classes=config.num_classes,
-            distillation=config.distillation,
-            drop=config.drop_rate,
-        )
+        # self.head = SWIFTNetHead(
+        #     dim=self.num_features,
+        #     num_classes=config.num_classes,
+        #     distillation=config.distillation,
+        #     drop=config.drop_rate,
+        # )
 
-        self.apply(self._init_weights)
+        # self.apply(self._init_weights)
 
     # ------------------------------------------------------------------
 
