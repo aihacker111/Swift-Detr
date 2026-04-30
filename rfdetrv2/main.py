@@ -884,7 +884,7 @@ def get_args_parser():
     parser.add_argument('--device',    default='cuda')
     parser.add_argument('--world_size', default=1,       type=int)
     parser.add_argument('--dist_url',   default='env://')
-    parser.add_argument('--sync_bn',    default=True,    type=bool)
+    parser.add_argument('--sync_bn',    default=False,   type=bool)
 
     # FP16
     parser.add_argument('--fp16_eval', default=False, action='store_true')
@@ -1037,7 +1037,7 @@ def populate_args(
     device='cuda',
     world_size=1,
     dist_url='env://',
-    sync_bn=True,
+    sync_bn=False,
     # FP16
     fp16_eval=False,
     # Custom

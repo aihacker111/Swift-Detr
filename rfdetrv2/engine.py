@@ -1773,6 +1773,7 @@
 """
 Train and eval functions used in main.py
 """
+import contextlib
 import math
 import random
 from typing import Iterable, List, Sequence
@@ -2077,21 +2078,25 @@ def train_one_epoch(
                 {k: v.to(device) for k, v in t.items()}
                 for t in targets[start_idx:final_idx]
             ]
- 
-            # ============================================================
-            # SUPERVISED PASS — giống hệt engine.py gốc, không thay đổi gì
-            # ============================================================
-            with autocast(**get_autocast_args(args)):
-                outputs   = model(new_samples, new_targets)
-                loss_dict = criterion(outputs, new_targets)
-                weight_dict = criterion.weight_dict
-                losses = sum(
-                    (1 / args.grad_accum_steps) * loss_dict[k] * weight_dict[k]
-                    for k in loss_dict.keys()
-                    if k in weight_dict
-                )
-            del outputs
-            scaler.scale(losses).backward()
+
+            is_last_accum_step = (i == args.grad_accum_steps - 1)
+            sync_ctx = (
+                contextlib.nullcontext()
+                if (not args.distributed or is_last_accum_step)
+                else model.no_sync()
+            )
+            with sync_ctx:
+                with autocast(**get_autocast_args(args)):
+                    outputs   = model(new_samples, new_targets)
+                    loss_dict = criterion(outputs, new_targets)
+                    weight_dict = criterion.weight_dict
+                    losses = sum(
+                        (1 / args.grad_accum_steps) * loss_dict[k] * weight_dict[k]
+                        for k in loss_dict.keys()
+                        if k in weight_dict
+                    )
+                del outputs
+                scaler.scale(losses).backward()
 
         # Optimizer step — giống gốc hoàn toàn
         loss_dict_reduced = utils.reduce_dict(loss_dict)
