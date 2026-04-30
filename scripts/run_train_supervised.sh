@@ -21,7 +21,7 @@ TRAIN_PY="${SCRIPT_DIR}/train_supervised.py"
 DATASET_DIR="${DATASET_DIR:-/workspace/coco}"
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output/swiftdetr_base_supervised}"
 NUM_GPUS="${NUM_GPUS:-4}"
-BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
+BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 MODEL_SIZE="${MODEL_SIZE:-base}"
 PRETRAINED_ENCODER="${PRETRAINED_ENCODER:-/workspace/Swift-Detr/checkpoints/swift_net_base/2026_04_26_15_28_59/checkpoint_best.pth}"
@@ -73,7 +73,7 @@ else
     --dataset-dir "${DATASET_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --batch-size "${BATCH_SIZE_PER_GPU}" \
-    --num-workers 4 \
+    --num-workers 8 \
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --use-varifocal-loss \
