@@ -10,7 +10,7 @@
 #   MODEL_SIZE           - tiny | small | base (default: base)
 #   PRETRAINED_ENCODER   - path to SwiftNet encoder .pth (passed as --pretrained-encoder when set)
 
-set -euo pipefail
+set -e
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
@@ -59,7 +59,7 @@ else
 fi
 
 torchrun --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
-  /Users/tinvo0908/Downloads/swift-detr/Swift-Detr/scripts/train_supervised.py \
+  "${TRAIN_PY}" \
   --dataset-dir "${DATASET_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
   --batch-size "${BATCH_SIZE_PER_GPU}" \
