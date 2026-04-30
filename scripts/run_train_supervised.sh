@@ -78,7 +78,7 @@ else
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --use-varifocal-loss \
-    --use_prototype_align \
+    --use-prototype-align \
     --tensorboard
 fi
 
