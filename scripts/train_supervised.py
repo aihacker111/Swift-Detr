@@ -165,7 +165,7 @@ def main() -> None:
         lr=args.lr,
         lr_encoder=args.lr_encoder,
         lr_scale_mode=args.lr_scale_mode,
-        lr_scheduler="cosine_restart",
+        lr_scheduler="cosine",
         lr_min_factor=args.lr_min_factor,
         lr_restart_period=args.lr_restart_period,
         lr_restart_decay=args.lr_restart_decay,

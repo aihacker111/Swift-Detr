@@ -26,7 +26,7 @@ BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-4}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 MODEL_SIZE="${MODEL_SIZE:-base}"
 PRETRAINED_ENCODER="${PRETRAINED_ENCODER:-/workspace/Swift-Detr/checkpoints/swift_net_base/2026_04_26_15_28_59/swift_detr_base.pth}"
-RESUME="${RESUME:-/workspace/Swift-Detr/output/swiftdetr_base_supervised/checkpoint.pth}"
+# RESUME="${RESUME:-/workspace/Swift-Detr/output/swiftdetr_base_supervised/checkpoint.pth}"
 
 echo "Checking GPUs..."
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -78,8 +78,8 @@ if [ -n "${PRETRAINED_ENCODER}" ]; then
     --amp \
     --use-varifocal-loss \
     --use-prototype-align \
-    --tensorboard \
-    ${RESUME_ARG}
+    --tensorboard
+    # ${RESUME_ARG}
 else
   torchrun --standalone --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
     "${TRAIN_PY}" \
@@ -92,8 +92,8 @@ else
     --amp \
     --use-varifocal-loss \
     --use-prototype-align \
-    --tensorboard \
-    ${RESUME_ARG}
+    --tensorboard
+    # ${RESUME_ARG}
 fi
 
 echo "Done."
