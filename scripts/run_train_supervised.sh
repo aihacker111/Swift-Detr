@@ -71,7 +71,7 @@ if [ -n "${PRETRAINED_ENCODER}" ]; then
     --dataset-dir "${DATASET_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --batch-size "${BATCH_SIZE_PER_GPU}" \
-    --num-workers 32 \
+    --num-workers 16 \
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --pretrained-encoder "${PRETRAINED_ENCODER}" \
@@ -86,7 +86,7 @@ else
     --dataset-dir "${DATASET_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --batch-size "${BATCH_SIZE_PER_GPU}" \
-    --num-workers 32 \
+    --num-workers 16 \
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --amp \
