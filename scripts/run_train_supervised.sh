@@ -13,7 +13,7 @@
 
 set -e
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8}"
 
 SCRIPT_DIR=$(dirname "$0")
 SCRIPT_DIR=$(cd "$SCRIPT_DIR" && pwd)
@@ -21,7 +21,7 @@ TRAIN_PY="${SCRIPT_DIR}/train_supervised.py"
 
 DATASET_DIR="${DATASET_DIR:-/workspace/coco}"
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/Swift-Detr/output/swiftdetr_base_supervised}"
-NUM_GPUS="${NUM_GPUS:-4}"
+NUM_GPUS="${NUM_GPUS:-8}"
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-8}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 MODEL_SIZE="${MODEL_SIZE:-base}"
@@ -71,7 +71,7 @@ if [ -n "${PRETRAINED_ENCODER}" ]; then
     --dataset-dir "${DATASET_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --batch-size "${BATCH_SIZE_PER_GPU}" \
-    --num-workers 16 \
+    --num-workers 32 \
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --pretrained-encoder "${PRETRAINED_ENCODER}" \
@@ -86,7 +86,7 @@ else
     --dataset-dir "${DATASET_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --batch-size "${BATCH_SIZE_PER_GPU}" \
-    --num-workers 16 \
+    --num-workers 32 \
     --epochs 50 \
     --model-size "${MODEL_SIZE}" \
     --amp \

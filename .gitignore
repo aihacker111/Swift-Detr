@@ -17,6 +17,8 @@ env/
 .DS_Store
 
 # Training / checkpoints (large)
+checkpoint_best_ema.pth
+swift_detr_base.pth
 dinov3/
 dinov3_pretrained/
 swiftnet_pretrained/

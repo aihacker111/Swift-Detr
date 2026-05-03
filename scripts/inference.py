@@ -22,27 +22,25 @@ from rfdetrv2.util.coco_classes import COCO_CLASSES
 def _get_class_name(cls_id: int, class_names: dict, use_coco_fallback: bool = True) -> str:
     """Resolve a human-readable class name from a raw model class id.
 
-    model.class_names can be in three formats:
-      A) {0: "person", 1: "bicycle", ...}  — 0-indexed string values  → use directly
-      B) {1: "person", 2: "bicycle", ...}  — 1-indexed string values  → use directly
-      C) {0: 1, 1: 2, 17: 18, 18: 19, ...} — int remapping dict       → IGNORE,
-         fall through to COCO_CLASSES with the raw id instead
-
-    For format C (RF-DETR default), the raw id IS already the correct COCO 1-indexed key:
-      raw=18 → COCO_CLASSES[18] = "dog"  ✓
+    PostProcess always returns 0-indexed labels (0..K-1). class_names can be:
+      A) {0: "person", 1: "bicycle", ...}  — 0-indexed  → look up raw directly
+      B) {1: "person", 2: "bicycle", ...}  — 1-indexed  → look up raw+1
+      C) {0: 1, 1: 2, ...}                 — int remap  → fall through to COCO_CLASSES
     """
     raw = int(cls_id)
 
-    # Only trust class_names values when they are actual name strings
-    for key in (raw, raw + 1):
-        val = class_names.get(key)
-        if isinstance(val, str):
-            return val
+    # Detect format: if key 0 is present it's 0-indexed (A or C), otherwise 1-indexed (B)
+    is_zero_indexed = 0 in class_names
+    key = raw if is_zero_indexed else raw + 1
 
-    # class_names has int values (remapping dict) or no match — use COCO directly
+    val = class_names.get(key)
+    if isinstance(val, str):
+        return val
+
+    # class_names has int values (format C) or no match — fall back to COCO
     if use_coco_fallback:
         if raw in COCO_CLASSES:
-            return COCO_CLASSES[raw]        # e.g. 18 → "dog"
+            return COCO_CLASSES[raw]
         if (raw + 1) in COCO_CLASSES:
             return COCO_CLASSES[raw + 1]
 
